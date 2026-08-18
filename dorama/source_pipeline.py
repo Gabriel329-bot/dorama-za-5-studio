@@ -20,6 +20,7 @@ from dorama.speech import synthesize
 from settings import CONFIG, PENDING_DIR
 from storage import db
 from job_control import checkpoint, ollama_generate, run_process
+from video_accel import selected_encoder_options
 
 
 @dataclass(frozen=True)
@@ -267,11 +268,13 @@ def _render_montage(
     filters.append(
         f"[bed][{voice_index}:a]amix=inputs=2:duration=first:weights='0.18 1.0'[audio]"
     )
+    encoder, encoder_args = selected_encoder_options()
+    print(f"  FFmpeg encoder: {encoder}")
     command.extend(
         [
             "-filter_complex", ";".join(filters),
             "-map", "[video]", "-map", "[audio]",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+            *encoder_args,
             "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
             "-t", f"{target_duration:.3f}", str(output_path),
         ]

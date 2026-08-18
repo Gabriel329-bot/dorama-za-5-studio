@@ -9,6 +9,7 @@ import math
 import re
 import subprocess
 import sys
+from time import monotonic
 from urllib.parse import quote, urlparse
 
 import imageio_ffmpeg
@@ -389,32 +390,92 @@ def _safe_video_id(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", value)[:120] or "licensed-source"
 
 
+def _cached_download(
+    candidate: LicensedCandidate,
+    destination_dir: Path,
+    metadata_path: Path,
+) -> Path | None:
+    if not metadata_path.is_file():
+        return None
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    if (
+        str(metadata.get("video_id") or "") != candidate.video_id
+        or str(metadata.get("permission_basis") or "") != candidate.permission_basis
+    ):
+        return None
+    prefix = _safe_video_id(candidate.video_id)
+    matches = [
+        path for path in destination_dir.glob(f"{prefix}.*")
+        if path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".ogv"}
+        and path.is_file()
+        and path.stat().st_size > 0
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda path: path.stat().st_mtime)
+
+
+def _write_license_metadata(path: Path, candidate: LicensedCandidate) -> None:
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(asdict(candidate), ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
 def _download_direct(candidate: LicensedCandidate, destination_dir: Path) -> Path:
     suffix = Path(urlparse(candidate.download_url).path).suffix.lower()
     if suffix not in {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".ogv"}:
         suffix = ".mp4"
     path = destination_dir / f"{_safe_video_id(candidate.video_id)}{suffix}"
+    partial_path = path.with_suffix(f"{path.suffix}.part")
     max_bytes = int(CONFIG["licensed_sources"].get("max_download_mb", 2200)) * 1024 * 1024
-    try:
-        with requests.get(candidate.download_url, headers={"User-Agent": USER_AGENT}, stream=True, timeout=(30, 180)) as response:
-            response.raise_for_status()
-            expected = int(response.headers.get("Content-Length") or 0)
-            if expected and expected > max_bytes:
-                raise RuntimeError("Разрешённый файл слишком большой для автоматической загрузки")
-            written = 0
-            with path.open("wb") as output:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    checkpoint()
-                    if not chunk:
-                        continue
-                    written += len(chunk)
-                    if written > max_bytes:
-                        raise RuntimeError("Загрузка остановлена: превышен лимит размера файла")
-                    output.write(chunk)
-            checkpoint()
-    except JobCancelled:
-        path.unlink(missing_ok=True)
-        raise
+    resume_at = partial_path.stat().st_size if partial_path.is_file() else 0
+    if resume_at > max_bytes:
+        partial_path.unlink(missing_ok=True)
+        resume_at = 0
+    if candidate.size_bytes and resume_at == candidate.size_bytes:
+        partial_path.replace(path)
+        return path
+
+    headers = {"User-Agent": USER_AGENT}
+    if resume_at:
+        headers["Range"] = f"bytes={resume_at}-"
+        print(f"  Продолжаю загрузку с {resume_at / 1024 / 1024:.1f} МБ")
+    with requests.get(candidate.download_url, headers=headers, stream=True, timeout=(30, 180)) as response:
+        if response.status_code == 416 and candidate.size_bytes and resume_at >= candidate.size_bytes:
+            partial_path.replace(path)
+            return path
+        response.raise_for_status()
+        append = resume_at > 0 and response.status_code == 206
+        written = resume_at if append else 0
+        expected_remaining = int(response.headers.get("Content-Length") or 0)
+        expected_total = written + expected_remaining if expected_remaining else candidate.size_bytes
+        if expected_total and expected_total > max_bytes:
+            raise RuntimeError("Разрешённый файл слишком большой для автоматической загрузки")
+        mode = "ab" if append else "wb"
+        started = monotonic()
+        last_reported = -1
+        with partial_path.open(mode) as output:
+            for chunk in response.iter_content(chunk_size=4 * 1024 * 1024):
+                checkpoint()
+                if not chunk:
+                    continue
+                written += len(chunk)
+                if written > max_bytes:
+                    raise RuntimeError("Загрузка остановлена: превышен лимит размера файла")
+                output.write(chunk)
+                if expected_total:
+                    percent = min(100, int(written * 100 / expected_total))
+                    bucket = percent // 10
+                    if bucket > last_reported:
+                        elapsed = max(monotonic() - started, 0.001)
+                        speed = max(written - (resume_at if append else 0), 0) / elapsed / 1024 / 1024
+                        print(f"  Загрузка: {percent}% · {written / 1024 / 1024:.0f} МБ · {speed:.1f} МБ/с")
+                        last_reported = bucket
+        checkpoint()
+    partial_path.replace(path)
     return path
 
 
@@ -422,6 +483,11 @@ def download_candidate(candidate: LicensedCandidate) -> tuple[Path, Path]:
     print(f"[2/7] Скачиваю разрешённый источник ({candidate.source}): {candidate.title}")
     destination_dir = INPUT_DIR / "licensed"
     destination_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = destination_dir / f"{_safe_video_id(candidate.video_id)}.license.json"
+    cached = _cached_download(candidate, destination_dir, metadata_path)
+    if cached is not None:
+        print(f"  Download cache: использую {cached.name}")
+        return cached, metadata_path
     if candidate.source == "YouTube":
         output_template = destination_dir / f"{_safe_video_id(candidate.video_id)}.%(ext)s"
         height = int(CONFIG["licensed_sources"].get("download_height", 1080))
@@ -429,12 +495,13 @@ def download_candidate(candidate: LicensedCandidate) -> tuple[Path, Path]:
         try:
             _run_yt_dlp([
                 "--no-playlist", "--ffmpeg-location", ffmpeg_dir,
+                "--continue", "--part", "--no-overwrites",
+                "--concurrent-fragments", "4", "--retries", "10", "--fragment-retries", "10",
                 "-f", f"bestvideo[height<={height}]+bestaudio/best[height<={height}]",
                 "--merge-output-format", "mp4", "-o", str(output_template), candidate.download_url or candidate.url,
             ], timeout=1800)
         except JobCancelled:
-            for partial in destination_dir.glob(f"{_safe_video_id(candidate.video_id)}.*"):
-                partial.unlink(missing_ok=True)
+            print("  Частичная загрузка сохранена и продолжится при повторном запуске")
             raise
         matches = [
             path for path in destination_dir.glob(f"{_safe_video_id(candidate.video_id)}.*")
@@ -445,8 +512,7 @@ def download_candidate(candidate: LicensedCandidate) -> tuple[Path, Path]:
         video_path = max(matches, key=lambda path: path.stat().st_mtime)
     else:
         video_path = _download_direct(candidate, destination_dir)
-    metadata_path = destination_dir / f"{_safe_video_id(candidate.video_id)}.license.json"
-    metadata_path.write_text(json.dumps(asdict(candidate), ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_license_metadata(metadata_path, candidate)
     return video_path, metadata_path
 
 

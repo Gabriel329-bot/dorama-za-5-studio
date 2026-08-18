@@ -3,8 +3,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+from queue import Empty, Queue
 import subprocess
-from threading import Event, local
+from threading import Event, Thread, local
 from time import monotonic
 from typing import Iterator
 
@@ -71,21 +72,65 @@ def run_process(command, *, capture_output: bool = False, text: bool = False,
 
 
 def ollama_generate(url: str, payload: dict, timeout: float = 600) -> str:
-    """Читать поток Ollama по частям, чтобы отмена срабатывала во время генерации."""
+    """Читать Ollama в отдельном потоке, сохраняя отмену до появления первого токена."""
     body = dict(payload)
     body["stream"] = True
+    body.setdefault("keep_alive", "15m")
     chunks: list[str] = []
-    with requests.post(url, json=body, stream=True, timeout=(10, 60)) as response:
-        response.raise_for_status()
-        for line in response.iter_lines():
+    messages: Queue[tuple[str, object]] = Queue()
+    response_holder: dict[str, requests.Response] = {}
+    session = requests.Session()
+
+    def read_stream() -> None:
+        response: requests.Response | None = None
+        try:
+            response = session.post(url, json=body, stream=True, timeout=(10, max(timeout, 60)))
+            response_holder["response"] = response
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line:
+                    messages.put(("line", line))
+            messages.put(("done", None))
+        except BaseException as exc:  # передаём исходный тип сетевой ошибки главному потоку
+            messages.put(("error", exc))
+        finally:
+            if response is not None:
+                response.close()
+
+    worker = Thread(target=read_stream, name="ollama-stream", daemon=True)
+    worker.start()
+    started = monotonic()
+    next_notice = 20.0
+    try:
+        while True:
             checkpoint()
-            if not line:
+            elapsed = monotonic() - started
+            remaining = timeout - elapsed
+            if remaining <= 0:
+                raise requests.Timeout(f"Ollama не завершила ответ за {timeout:.0f} секунд")
+            try:
+                kind, value = messages.get(timeout=min(0.25, remaining))
+            except Empty:
+                if elapsed >= next_notice:
+                    print(f"  Ollama обрабатывает контекст… {elapsed:.0f}с")
+                    next_notice += 30.0
                 continue
-            item = json.loads(line)
+            if kind == "error":
+                if isinstance(value, BaseException):
+                    raise value
+                raise RuntimeError(str(value))
+            if kind == "done":
+                break
+            item = json.loads(value)
             if item.get("error"):
                 raise RuntimeError(str(item["error"]))
             chunks.append(str(item.get("response") or ""))
             if item.get("done"):
                 break
-    checkpoint()
-    return "".join(chunks)
+        checkpoint()
+        return "".join(chunks)
+    finally:
+        response = response_holder.get("response")
+        if response is not None and worker.is_alive():
+            response.close()
+        session.close()

@@ -20,6 +20,7 @@ PENDING_DIR = ROOT_DIR / CONFIG["paths"]["pending_dir"]
 POSTED_DIR = ROOT_DIR / CONFIG["paths"]["posted_dir"]
 REJECTED_DIR = ROOT_DIR / CONFIG["paths"]["rejected_dir"]
 DB_PATH = ROOT_DIR / CONFIG["paths"]["db_path"]
+CACHE_DIR = ROOT_DIR / CONFIG["paths"].get("cache_dir", "storage/cache")
 
 YOUTUBE_CLIENT_SECRETS_PATH = ROOT_DIR / CONFIG["publishing"]["youtube"]["client_secrets_path"]
 YOUTUBE_TOKEN_PATH = ROOT_DIR / CONFIG["publishing"]["youtube"]["token_path"]

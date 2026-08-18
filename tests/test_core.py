@@ -2,12 +2,20 @@ import tempfile
 import sys
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from threading import Event, Timer
 
 from clipper.highlight import Highlight, _fit_duration, _overlaps_existing, _validate
 from clipper.render import _build_ass, _fmt_ass_time
-from clipper.transcribe import Word
+from clipper.transcribe import (
+    Transcript,
+    Word,
+    _compute_type,
+    _load_cached_transcript,
+    _save_cached_transcript,
+    _transcript_cache_key,
+)
 from dorama.discover import _parse_search, is_relevant, parse_duration, query_variants
 from dorama.render import _sentences
 from dorama.script import _ensure_narration_length, _grounded_narration, _normalize_hashtags
@@ -16,13 +24,15 @@ from dorama.source_pipeline import SourceScene, _build_sequence, _make_timeline,
 from dorama.licensed_sources import (
     LicensedCandidate,
     _candidate_from_metadata,
+    _cached_download,
     _permission_basis,
     _open_license_basis,
     _relevance_score,
     _score_candidate,
 )
+from video_accel import encoder_options
 from publisher.youtube import build_metadata
-from job_control import JobCancelled, cancellation_scope, checkpoint, run_process
+from job_control import JobCancelled, cancellation_scope, checkpoint, ollama_generate, run_process
 
 
 class HighlightValidationTests(unittest.TestCase):
@@ -209,6 +219,55 @@ class DoramaTests(unittest.TestCase):
         self.assertGreater(_relevance_score(relevant, "китайская дорама"), 0)
         self.assertEqual(0, _relevance_score(unrelated, "китайская дорама"))
 
+    def test_whisper_auto_compute_type_uses_gpu_float16_and_cpu_int8(self):
+        self.assertEqual("float16", _compute_type("cuda"))
+        self.assertEqual("int8", _compute_type("cpu"))
+
+    def test_transcript_cache_round_trip_and_file_change_invalidation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "episode.mp4"
+            video.write_bytes(b"first-version")
+            first_key = _transcript_cache_key(video, "zh")
+            transcript = Transcript("первая сцена", [Word("первая", 0.0, 0.5), Word("сцена", 0.5, 1.0)])
+            with patch("clipper.transcribe.CACHE_DIR", root / "cache"):
+                _save_cached_transcript(video, "zh", transcript)
+                cached = _load_cached_transcript(video, "zh")
+            self.assertEqual(transcript, cached)
+            video.write_bytes(b"second-version-is-longer")
+            self.assertNotEqual(first_key, _transcript_cache_key(video, "zh"))
+
+    def test_encoder_options_cover_hardware_and_software_fallback(self):
+        self.assertIn("h264_nvenc", encoder_options("h264_nvenc"))
+        self.assertIn("h264_qsv", encoder_options("h264_qsv"))
+        software = encoder_options("libx264", still_image=True)
+        self.assertIn("libx264", software)
+        self.assertIn("stillimage", software)
+
+    def test_verified_download_is_reused_from_cache(self):
+        candidate = LicensedCandidate(
+            video_id="cached-source",
+            title="Chinese drama",
+            channel="Author",
+            channel_id="",
+            url="https://example.com/video",
+            duration=300,
+            views=0,
+            license="CC BY",
+            permission_basis="creative-commons-by",
+            source="Wikimedia Commons",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "cached-source.mp4"
+            video.write_bytes(b"video")
+            metadata = root / "cached-source.license.json"
+            metadata.write_text(
+                '{"video_id":"cached-source","permission_basis":"creative-commons-by"}',
+                encoding="utf-8",
+            )
+            self.assertEqual(video, _cached_download(candidate, root, metadata))
+
 
 class YouTubeMetadataTests(unittest.TestCase):
     def test_hashtags_become_youtube_tags_and_sources_are_appended(self):
@@ -226,6 +285,58 @@ class YouTubeMetadataTests(unittest.TestCase):
 
 
 class JobCancellationTests(unittest.TestCase):
+    class _SlowOllamaResponse:
+        def __init__(self, delay: float = 0.15):
+            self.delay = delay
+            self.closed = False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self):
+            time.sleep(self.delay)
+            yield '{"response":"готово","done":true}'.encode("utf-8")
+
+        def close(self):
+            self.closed = True
+
+    class _FakeSession:
+        def __init__(self, response):
+            self.response = response
+            self.post_kwargs = None
+
+        def post(self, _url, **kwargs):
+            self.post_kwargs = kwargs
+            return self.response
+
+        def close(self):
+            return None
+
+    def test_ollama_waits_for_slow_first_token_and_keeps_model_warm(self):
+        response = self._SlowOllamaResponse()
+        session = self._FakeSession(response)
+        with patch("job_control.requests.Session", return_value=session):
+            result = ollama_generate("http://ollama/api/generate", {"model": "test"}, timeout=2)
+        self.assertEqual("готово", result)
+        self.assertEqual("15m", session.post_kwargs["json"]["keep_alive"])
+        self.assertEqual((10, 60), session.post_kwargs["timeout"])
+
+    def test_ollama_can_be_cancelled_before_first_token(self):
+        event = Event()
+        response = self._SlowOllamaResponse(delay=2)
+        session = self._FakeSession(response)
+        timer = Timer(0.1, event.set)
+        timer.start()
+        started = time.monotonic()
+        try:
+            with patch("job_control.requests.Session", return_value=session):
+                with self.assertRaises(JobCancelled):
+                    with cancellation_scope(event):
+                        ollama_generate("http://ollama/api/generate", {"model": "test"}, timeout=5)
+        finally:
+            timer.cancel()
+        self.assertLess(time.monotonic() - started, 1)
+
     def test_cancellation_stops_only_selected_queued_job(self):
         from webapp.app import _submit_job, cancel_job, jobs, jobs_lock
 

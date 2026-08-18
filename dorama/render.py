@@ -10,6 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from clipper.render import _ass_escape_path, _fmt_ass_time
 from job_control import run_process
+from video_accel import selected_encoder_options
 from settings import CONFIG
 
 
@@ -131,10 +132,12 @@ def render_video(
         render_audio = audio_path
         duration = _audio_duration(audio_path)
     create_subtitles(narration, duration, ass_path)
+    encoder, encoder_args = selected_encoder_options(still_image=True)
+    print(f"  FFmpeg encoder: {encoder}")
     command = [
         imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loop", "1", "-i", str(cover_path),
         "-i", str(render_audio), "-vf", f"subtitles='{_ass_escape_path(ass_path)}'",
-        "-c:v", "libx264", "-preset", "veryfast", "-tune", "stillimage", "-crf", "21",
+        *encoder_args,
         "-c:a", "aac", "-b:a", "160k", "-pix_fmt", "yuv420p", "-shortest", str(output_path),
     ]
     result = run_process(command, capture_output=True, text=True)

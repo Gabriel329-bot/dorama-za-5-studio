@@ -3,7 +3,9 @@
 whisper:
   model: medium        # tiny/base/small/medium/large-v3 — больше = точнее и медленнее
   language: ru
-  device: cpu           # cpu или cuda, если есть nvidia-gpu
+  device: cuda          # RTX/NVIDIA: cuda; при ошибке программа безопасно вернётся на CPU
+  compute_type: auto    # auto = float16 на CUDA, int8 на CPU
+  cuda_fallback: true
 
 highlight:
   provider: ollama
@@ -17,6 +19,11 @@ highlight:
 render:
   output_width: 1080
   output_height: 1920
+  video_encoder: auto   # auto: NVENC -> QSV -> AMF -> libx264
+  hardware_quality: 22
+  hardware_preset: p4
+  software_crf: 21
+  software_preset: veryfast
   font: Arial
   font_size: 64
   highlight_color: "&H0000D7FF"   # ASS BGR: жёлтый — подсветка текущего слова
@@ -68,8 +75,8 @@ episode:
 licensed_sources:
   youtube_search_results: 10
   search_sources: [youtube, wikimedia_commons, internet_archive]
-  download_height: 1080
-  max_download_mb: 2200
+  download_height: 720
+  max_download_mb: 700
   require_creative_commons: true
   # Канал можно добавить только при наличии отдельного письменного разрешения.
   # Формат: "UC_CHANNEL_ID": "номер договора или ссылка на разрешение"
@@ -81,3 +88,4 @@ paths:
   posted_dir: output/posted
   rejected_dir: output/rejected
   db_path: storage/queue.db
+  cache_dir: storage/cache

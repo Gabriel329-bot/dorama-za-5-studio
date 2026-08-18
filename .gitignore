@@ -24,6 +24,7 @@ output/**
 !output/rejected/.gitkeep
 storage/*.db
 storage/*.db-*
+storage/cache/
 oauth/
 client_secret*.json
 client_secrets*.json

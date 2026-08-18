@@ -6,6 +6,7 @@ import imageio_ffmpeg
 
 from job_control import run_process
 from settings import CONFIG
+from video_accel import selected_encoder_options
 from clipper.transcribe import Word
 from clipper.highlight import Highlight
 
@@ -91,6 +92,8 @@ def render_clip(source_video: str, highlight: Highlight, words: list[Word], outp
         f"subtitles='{_ass_escape_path(ass_path)}'"
     )
 
+    encoder, encoder_args = selected_encoder_options()
+    print(f"  FFmpeg encoder: {encoder}")
     cmd = [
         FFMPEG_EXE,
         "-y",
@@ -98,9 +101,7 @@ def render_clip(source_video: str, highlight: Highlight, words: list[Word], outp
         "-i", source_video,
         "-t", str(duration),
         "-vf", vf,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "20",
+        *encoder_args,
         "-c:a", "aac",
         "-b:a", "160k",
         str(output_path),
