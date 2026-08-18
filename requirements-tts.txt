@@ -1,0 +1,3 @@
+# Устанавливается только в отдельное Python 3.11 окружение tts-venv.
+# CUDA-сборка PyTorch ставится отдельно из https://download.pytorch.org/whl/cu124
+git+https://github.com/resemble-ai/chatterbox.git@5de7a54aa4e5e2baadb0182dde554908b48b85c2

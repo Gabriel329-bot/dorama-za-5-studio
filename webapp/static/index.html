@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#120c0f" />
+    <meta
+      name="description"
+      content="Дорама за 5 — локальная студия генерации, озвучки и автоматической публикации видео."
+    />
+    <title>Дорама за 5 — Studio</title>
+    <link rel="icon" href="/brand/avatar-dorama-za-5.png" />
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div class="ambient ambient-one"></div>
+    <div class="ambient ambient-two"></div>
+
+    <header class="topbar shell">
+      <a class="brand" href="#top" aria-label="Дорама за 5 — главная">
+        <img src="/brand/avatar-dorama-za-5.png" alt="" />
+        <span class="brand-copy">
+          <strong>ДОРАМА ЗА 5</strong>
+          <small>CREATOR STUDIO</small>
+        </span>
+      </a>
+      <nav aria-label="Разделы панели">
+        <a href="#create">Создать</a>
+        <a href="#queue">Очередь</a>
+        <a href="#automation">Автоматизация</a>
+      </nav>
+      <div class="top-actions">
+        <div class="live-pill"><span></span><b id="systemLabel">Проверяю систему</b></div>
+        <button class="icon-button" id="refreshButton" type="button" aria-label="Обновить данные">↻</button>
+      </div>
+    </header>
+
+    <main id="top">
+      <section class="hero shell">
+        <div class="hero-copy">
+          <div class="eyebrow"><span>01</span> Локальная AI-студия</div>
+          <h1>Один запрос.<br /><em>Готовый выпуск.</em></h1>
+          <p class="hero-lead">
+            Находит тренд-сигналы, пишет оригинальный сценарий, озвучивает, собирает
+            вертикальное видео и ставит его в очередь YouTube — без чужих эпизодов.
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#create">Создать выпуск <span>↗</span></a>
+            <a class="button button-ghost" href="#queue">Открыть очередь</a>
+          </div>
+          <div class="hero-proof">
+            <div><b>5:00</b><span>целевая длина</span></div>
+            <div><b>RU</b><span>проверенная озвучка</span></div>
+            <div><b>24/7</b><span>планировщик</span></div>
+          </div>
+        </div>
+
+        <div class="hero-visual" aria-label="Схема автоматического конвейера">
+          <div class="hero-image"></div>
+          <div class="visual-topline">
+            <span>PIPELINE / LIVE</span>
+            <span class="status-dot">ONLINE</span>
+          </div>
+          <div class="pipeline-list">
+            <article class="pipeline-step done">
+              <span class="step-index">01</span>
+              <div><b>Поиск сигналов</b><small>5 видеоплощадок · параллельно</small></div>
+              <i>✓</i>
+            </article>
+            <article class="pipeline-step done">
+              <span class="step-index">02</span>
+              <div><b>Сценарий без спойлеров</b><small>Qwen 2.5 · локально</small></div>
+              <i>✓</i>
+            </article>
+            <article class="pipeline-step active">
+              <span class="step-index">03</span>
+              <div><b>TikTok Story Voice</b><small>Edge TTS + Whisper QA</small></div>
+              <i class="pulse"></i>
+            </article>
+            <article class="pipeline-step">
+              <span class="step-index">04</span>
+              <div><b>1080 × 1920</b><small>Субтитры и обложка</small></div>
+              <i>→</i>
+            </article>
+          </div>
+          <div class="visual-footer"><span>Только оригинальный контент</span><b>SAFE MODE</b></div>
+        </div>
+      </section>
+
+      <section class="metrics shell" aria-label="Состояние проекта">
+        <article class="metric-card accent">
+          <span class="metric-icon">◫</span>
+          <div><small>В очереди</small><strong id="pendingMetric">—</strong></div>
+          <span class="metric-note">на проверку</span>
+        </article>
+        <article class="metric-card">
+          <span class="metric-icon">↗</span>
+          <div><small>Опубликовано</small><strong id="postedMetric">—</strong></div>
+          <span class="metric-note">всего</span>
+        </article>
+        <article class="metric-card">
+          <span class="metric-icon">◷</span>
+          <div><small>Следующий слот</small><strong id="nextMetric">—</strong></div>
+          <span class="metric-note">YouTube</span>
+        </article>
+        <article class="metric-card">
+          <span class="metric-icon">●</span>
+          <div><small>Автоматизация</small><strong id="automationMetric">—</strong></div>
+          <span class="metric-note">Windows</span>
+        </article>
+      </section>
+
+      <section class="workspace shell" id="create">
+        <div class="section-heading">
+          <div>
+            <span class="kicker">СТУДИЯ / НОВЫЙ ВЫПУСК</span>
+            <h2>Создать контент</h2>
+          </div>
+          <p>Создайте обзор по нескольким видеоплощадкам или загрузите свою лицензированную серию для пятиминутного пересказа.</p>
+        </div>
+
+        <div class="creator-grid">
+          <article class="creator-card primary-creator">
+            <div class="card-heading">
+              <div class="creator-mark">文</div>
+              <div><small>ОРИГИНАЛЬНЫЙ ФОРМАТ</small><h3>Дорама-радар</h3></div>
+              <span class="ready-badge">ГОТОВО</span>
+            </div>
+            <form id="doramaForm">
+              <label>
+                <span>Тема выпуска</span>
+                <input id="queryInput" name="query" type="text" minlength="3" maxlength="180" required />
+              </label>
+              <fieldset class="source-mode">
+                <legend>Режим поиска</legend>
+                <label>
+                  <input type="radio" name="sourceMode" value="licensed" checked />
+                  <span><b>Автопоиск CC</b><small>YouTube + открытые медиатеки</small></span>
+                </label>
+                <label>
+                  <input type="radio" name="sourceMode" value="radar" />
+                  <span><b>Мультиплатформенный радар</b><small>5 площадок · ссылки и метаданные</small></span>
+                </label>
+              </fieldset>
+              <div class="form-split">
+                <label>
+                  <span>Результатов на источник</span>
+                  <select id="limitInput" name="limit">
+                    <option value="6">6 — быстро</option>
+                    <option value="10" selected>10 — оптимально</option>
+                    <option value="15">15 — глубже</option>
+                    <option value="25">25 — широкий поиск</option>
+                    <option value="40">40 — максимум</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Формат</span>
+                  <div class="locked-field">05:00 · 9:16 <b>LOCK</b></div>
+                </label>
+              </div>
+              <div class="tags-block">
+                <span>Хештеги</span>
+                <div id="hashtags" class="tag-list"></div>
+              </div>
+              <div class="form-summary">
+                <span><i>✓</i> Проверка лицензии</span>
+                <span><i>✓</i> Озвучка с QA</span>
+                <span><i>✓</i> Ручная проверка</span>
+              </div>
+              <p class="license-hint" id="licenseHint">Поиск идёт в YouTube, Wikimedia Commons и Internet Archive. Скачивание — только CC BY/CC BY-SA/CC0, public domain или разрешённый канал.</p>
+              <button class="button button-primary full" type="submit">
+                Найти и собрать выпуск <span>→</span>
+              </button>
+            </form>
+          </article>
+
+          <article class="creator-card upload-creator">
+            <div class="card-heading">
+              <div class="creator-mark muted">剪</div>
+              <div><small>СВОЯ ИЛИ ЛИЦЕНЗИРОВАННАЯ СЕРИЯ</small><h3>Серия → 5 минут</h3></div>
+            </div>
+            <form id="uploadForm">
+              <label class="dropzone" id="dropzone">
+                <input id="videoFile" type="file" accept="video/mp4,video/quicktime,video/x-matroska,video/webm" />
+                <span class="upload-icon">＋</span>
+                <b id="uploadTitle">Перетащите серию или трейлер</b>
+                <small id="uploadHint">ваш файл с правом использования · MP4, MOV, MKV, WEBM</small>
+              </label>
+              <label class="focus-field">
+                <span>Фокус пересказа</span>
+                <input id="episodeFocus" type="text" maxlength="300" placeholder="Например: интрига без раскрытия финала" />
+              </label>
+              <ul class="feature-list">
+                <li><span>01</span><div><b>Сюжетный таймлайн</b><small>распознаёт речь на любом языке</small></div></li>
+                <li><span>02</span><div><b>Ключевые сцены</b><small>монтаж ровно на пять минут</small></div></li>
+                <li><span>03</span><div><b>Русский сторителлинг</b><small>озвучка, QA и субтитры</small></div></li>
+              </ul>
+              <label class="rights-check">
+                <input id="rightsConfirm" type="checkbox" />
+                <span>Подтверждаю, что у меня есть права на использование этого видео</span>
+              </label>
+              <button class="button button-secondary full" id="clipButton" type="submit" disabled>
+                Сделать пересказ на 5 минут <span>→</span>
+              </button>
+            </form>
+          </article>
+
+          <aside class="activity-panel">
+            <div class="panel-heading"><div><small>LIVE</small><h3>Процессы</h3></div><span id="jobCount">0</span></div>
+            <div id="jobsList" class="jobs-list">
+              <div class="empty-state compact"><span>◎</span><p>Новых задач пока нет</p></div>
+            </div>
+            <button class="text-button" id="doctorButton" type="button">Проверить все компоненты <span>↗</span></button>
+          </aside>
+        </div>
+      </section>
+
+      <section class="queue-section shell" id="queue">
+        <div class="section-heading inline-heading">
+          <div><span class="kicker">КОНТРОЛЬ КАЧЕСТВА</span><h2>Очередь публикации</h2></div>
+          <div class="queue-filters" role="group" aria-label="Фильтр очереди">
+            <button class="active" data-filter="all" type="button">Все</button>
+            <button data-filter="pending" type="button">На проверке</button>
+            <button data-filter="posted" type="button">Опубликовано</button>
+          </div>
+        </div>
+        <div class="queue-card">
+          <div class="queue-head">
+            <span>Выпуск</span><span>Статус</span><span>Создан</span><span>Действия</span>
+          </div>
+          <div id="queueList" class="queue-list">
+            <div class="empty-state"><span>◌</span><h3>Загружаю очередь</h3></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="automation-section shell" id="automation">
+        <div class="section-heading">
+          <div><span class="kicker">ПУБЛИКАЦИЯ / 24×7</span><h2>Автоматизация</h2></div>
+          <p>Площадки подключаются только официальными способами. Публикация всегда проходит через очередь.</p>
+        </div>
+        <div class="platform-grid">
+          <article class="platform-card" id="youtubeCard">
+            <div class="platform-icon youtube">▶</div>
+            <div class="platform-main"><small>ПОДКЛЮЧЕНО</small><h3>YouTube</h3><p id="youtubeDetail">Проверяю OAuth…</p></div>
+            <div class="platform-actions"><span class="switch on" aria-label="YouTube включён"></span><button type="button" id="settingsButton">Настроить</button></div>
+          </article>
+          <article class="platform-card dimmed">
+            <div class="platform-icon tiktok">♪</div>
+            <div class="platform-main"><small>ОЖИДАЕТ ДОСТУПА</small><h3>TikTok</h3><p>Потребуется проверенное приложение Content Posting API</p></div>
+            <div class="platform-actions"><span class="switch" aria-label="TikTok выключен"></span><button type="button" disabled>Скоро</button></div>
+          </article>
+          <article class="platform-card" id="telegramCard">
+            <div class="platform-icon telegram">➤</div>
+            <div class="platform-main"><small>ДОПОЛНИТЕЛЬНЫЙ КАНАЛ</small><h3>Telegram</h3><p id="telegramDetail">Проверяю настройки…</p></div>
+            <div class="platform-actions"><span class="switch" id="telegramSwitch" aria-label="Telegram выключен"></span><button type="button" disabled>Настройки</button></div>
+          </article>
+        </div>
+        <div class="automation-note">
+          <span class="shield">◆</span>
+          <div><b>Безопасная автоматика</b><p>Новые ролики создаются приватными. Публичный доступ можно выбрать только вручную перед отправкой.</p></div>
+          <button class="button button-ghost" id="runSchedulerButton" type="button">Проверить расписание</button>
+        </div>
+      </section>
+    </main>
+
+    <footer class="shell">
+      <div class="brand footer-brand"><img src="/brand/avatar-dorama-za-5.png" alt="" /><span class="brand-copy"><strong>ДОРАМА ЗА 5</strong><small>LOCAL CREATOR STUDIO</small></span></div>
+      <p>Оригинальные истории · Проверенная озвучка · Официальная публикация</p>
+      <span id="lastUpdated">—</span>
+    </footer>
+
+    <dialog id="publishDialog" class="modal">
+      <form method="dialog" class="modal-card" id="publishForm">
+        <button class="modal-close" type="button" data-close-dialog aria-label="Закрыть">×</button>
+        <span class="modal-kicker">ПУБЛИКАЦИЯ</span>
+        <h2>Отправить на YouTube</h2>
+        <p id="publishTitle">Выберите режим доступа. Для первой проверки рекомендуем приватный.</p>
+        <div class="privacy-options">
+          <label><input type="radio" name="privacy" value="private" checked /><span><b>Приватный</b><small>видите только вы</small></span></label>
+          <label><input type="radio" name="privacy" value="unlisted" /><span><b>По ссылке</b><small>не показывается в канале</small></span></label>
+          <label><input type="radio" name="privacy" value="public" /><span><b>Публичный</b><small>увидят подписчики</small></span></label>
+        </div>
+        <div class="modal-actions"><button class="button button-ghost" type="button" data-close-dialog>Отмена</button><button class="button button-primary" id="confirmPublish" type="submit">Начать загрузку</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="settingsDialog" class="modal">
+      <form method="dialog" class="modal-card" id="settingsForm">
+        <button class="modal-close" type="button" data-close-dialog aria-label="Закрыть">×</button>
+        <span class="modal-kicker">YOUTUBE / РАСПИСАНИЕ</span>
+        <h2>Автопубликация</h2>
+        <label class="toggle-row"><span><b>Включить расписание</b><small>проверка каждые 15 минут</small></span><input id="scheduleEnabled" type="checkbox" /></label>
+        <label><span>Время публикации</span><input id="scheduleTimes" type="text" placeholder="12:00, 19:00" /></label>
+        <label><span>Доступ по умолчанию</span><select id="schedulePrivacy"><option value="private">Приватный — рекомендуется</option><option value="unlisted">По ссылке</option><option value="public">Публичный</option></select></label>
+        <p class="warning-note">Публичный режим будет автоматически отправлять одобренный ролик подписчикам. Используйте его только после проверки нескольких приватных загрузок.</p>
+        <div class="modal-actions"><button class="button button-ghost" type="button" data-close-dialog>Отмена</button><button class="button button-primary" id="saveSettings" type="submit">Сохранить</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="previewDialog" class="modal preview-modal">
+      <div class="modal-card">
+        <button class="modal-close" id="closePreview" type="button" aria-label="Закрыть">×</button>
+        <span class="modal-kicker">ПРЕДПРОСМОТР</span>
+        <h2 id="previewTitle">Выпуск</h2>
+        <video id="previewVideo" controls preload="metadata"></video>
+      </div>
+    </dialog>
+
+    <div class="toast-stack" id="toasts" aria-live="polite"></div>
+  </body>
+</html>
