@@ -11,6 +11,15 @@ _csrf_token = ""
 JsonDict: TypeAlias = dict[str, Any]
 
 
+def _client() -> httpx.Client:
+    """Локальный API никогда не должен ходить через системный HTTP(S)-proxy."""
+    return httpx.Client(
+        base_url=BASE,
+        timeout=httpx.Timeout(_TIMEOUT, connect=2.0),
+        trust_env=False,
+    )
+
+
 def _json_object(response: httpx.Response) -> JsonDict:
     response.raise_for_status()
     payload = response.json()
@@ -20,28 +29,28 @@ def _json_object(response: httpx.Response) -> JsonDict:
 
 
 def _get(path: str) -> JsonDict:
-    return _json_object(httpx.get(f"{BASE}{path}", timeout=_TIMEOUT))
+    with _client() as client:
+        return _json_object(client.get(path))
 
 
 def _post(path: str, json: JsonDict | None = None) -> JsonDict:
     global _csrf_token
     if not _csrf_token:
         _csrf_token = _get("/api/session")["csrf_token"]
-    r = httpx.post(
-        f"{BASE}{path}",
-        json=json,
-        headers={"X-Dorama-CSRF": _csrf_token},
-        timeout=_TIMEOUT,
-    )
-    if r.status_code == 403:
-        _csrf_token = _get("/api/session")["csrf_token"]
-        r = httpx.post(
-            f"{BASE}{path}",
+    with _client() as client:
+        response = client.post(
+            path,
             json=json,
             headers={"X-Dorama-CSRF": _csrf_token},
-            timeout=_TIMEOUT,
         )
-    return _json_object(r)
+        if response.status_code == 403:
+            _csrf_token = _get("/api/session")["csrf_token"]
+            response = client.post(
+                path,
+                json=json,
+                headers={"X-Dorama-CSRF": _csrf_token},
+            )
+        return _json_object(response)
 
 
 def dashboard() -> JsonDict:

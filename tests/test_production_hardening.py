@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from dorama.licensed_sources import _validate_download_url
 from storage import db
+from telegram_bot import api_client
 from webapp.app import app
 from webapp.health import HealthService
 from webapp.jobs import JobManager
@@ -54,6 +55,14 @@ class ApiSecurityTests(unittest.TestCase):
                 "https://upload.wikimedia.org/video.mp4", "Wikimedia Commons"
             ),
         )
+
+    def test_telegram_local_client_ignores_proxy_environment(self) -> None:
+        with patch("telegram_bot.api_client.httpx.Client") as client_factory:
+            api_client._client()
+        client_factory.assert_called_once()
+        kwargs = client_factory.call_args.kwargs
+        self.assertEqual(api_client.BASE, kwargs["base_url"])
+        self.assertFalse(kwargs["trust_env"])
 
 
 class AtomicQueueTests(unittest.TestCase):
