@@ -106,6 +106,7 @@ episode:
   target_duration_seconds: 300
   target_narration_words: 680
   scene_count: 9
+  original_audio_volume: 0.16
   source_language: auto
   require_rights_confirmation: true
 

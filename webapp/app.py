@@ -327,20 +327,39 @@ def upload_video(file: Annotated[UploadFile, File(...)]) -> ApiResponse:
     }
 
 
-@app.get("/api/uploads/{filename}/video")
-def uploaded_video(filename: str) -> FileResponse:
-    source = (INPUT_DIR / Path(filename).name).resolve()
+def _input_video(filename: str) -> Path:
+    source: Path = (INPUT_DIR / Path(filename).name).resolve()
     if source.parent != INPUT_DIR.resolve() or not source.is_file():
         raise HTTPException(404, "Загруженный файл не найден")
+    return source
+
+
+@app.get("/api/uploads/{filename}")
+def uploaded_video_metadata(filename: str) -> ApiResponse:
+    source = _input_video(filename)
+    try:
+        duration = probe_video_duration(source)
+    except UploadValidationError as exc:
+        raise HTTPException(415, str(exc)) from exc
+    return {
+        "filename": source.name,
+        "display_name": source.name,
+        "size_mb": round(source.stat().st_size / 1024 / 1024, 1),
+        "duration_seconds": round(duration, 3),
+        "editor_required": duration > 300.0,
+    }
+
+
+@app.get("/api/uploads/{filename}/video")
+def uploaded_video(filename: str) -> FileResponse:
+    source = _input_video(filename)
     media_type, _ = mimetypes.guess_type(source.name)
     return FileResponse(source, media_type=media_type or "video/mp4")
 
 
 @app.post("/api/jobs/clip", status_code=202)
 def create_clips(payload: ClipRequest) -> JobRecord:
-    source = (INPUT_DIR / Path(payload.filename).name).resolve()
-    if source.parent != INPUT_DIR.resolve() or not source.is_file():
-        raise HTTPException(404, "Загруженный файл не найден")
+    source = _input_video(payload.filename)
     return _submit_persistent_job(
         "clip",
         f"Нарезка: {source.name}",
@@ -352,9 +371,7 @@ def create_clips(payload: ClipRequest) -> JobRecord:
 def create_episode(payload: EpisodeRequest) -> JobRecord:
     if CONFIG["episode"].get("require_rights_confirmation", True) and not payload.rights_confirmed:
         raise HTTPException(422, "Подтвердите права на загруженный материал")
-    source = (INPUT_DIR / Path(payload.filename).name).resolve()
-    if source.parent != INPUT_DIR.resolve() or not source.is_file():
-        raise HTTPException(404, "Загруженный файл не найден")
+    source = _input_video(payload.filename)
     if payload.mode == "translate":
         from dorama.literal_translation import validate_translation_interval
 
@@ -488,6 +505,14 @@ def edit_caption(clip_id: int, payload: CaptionRequest) -> ApiResponse:
     return {"ok": True}
 
 
+@app.get("/api/clips/{clip_id}")
+def clip_detail(clip_id: int) -> ApiResponse:
+    clip = db.get_clip(clip_id)
+    if clip is None:
+        raise HTTPException(404, "Ролик не найден")
+    return _serialize_clip(clip)
+
+
 @app.get("/api/clips/{clip_id}/video")
 def clip_video(clip_id: int) -> FileResponse:
     clip = db.get_clip(clip_id)
@@ -518,7 +543,7 @@ def get_pipeline_settings() -> ApiResponse:
         "pitch": CONFIG["dorama"]["pitch"],
         "target_duration_seconds": CONFIG["dorama"]["target_duration_seconds"],
         "scene_count": CONFIG["episode"]["scene_count"],
-        "original_audio_volume": CONFIG["episode"]["original_audio_volume"],
+        "original_audio_volume": CONFIG["episode"].get("original_audio_volume", 0.16),
         "target_script_words": CONFIG["dorama"]["target_script_words"],
         "require_review": CONFIG["dorama"]["require_review"],
     }
