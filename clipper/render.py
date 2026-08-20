@@ -1,14 +1,13 @@
 """Рендер вертикального клипа с горящими субтитрами через ffmpeg."""
-import subprocess
 from pathlib import Path
 
-import imageio_ffmpeg
+import imageio_ffmpeg  # type: ignore[import-untyped]
 
+from clipper.highlight import Highlight
+from clipper.transcribe import Word
 from job_control import run_process
 from settings import CONFIG
 from video_accel import selected_encoder_options
-from clipper.transcribe import Word
-from clipper.highlight import Highlight
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 WORDS_PER_CAPTION_CHUNK = 4
@@ -26,8 +25,7 @@ def _chunk_words(words: list[Word]) -> list[list[Word]]:
 
 
 def _fmt_ass_time(seconds: float) -> str:
-    if seconds < 0:
-        seconds = 0
+    seconds = max(seconds, 0)
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = seconds % 60
@@ -107,9 +105,14 @@ def render_clip(source_video: str, highlight: Highlight, words: list[Word], outp
         str(output_path),
     ]
 
-    result = run_process(cmd, capture_output=True, text=True)
+    try:
+        result = run_process(cmd, capture_output=True, text=True)
+    except BaseException:
+        output_path.unlink(missing_ok=True)
+        raise
+    finally:
+        ass_path.unlink(missing_ok=True)
     if result.returncode != 0:
+        output_path.unlink(missing_ok=True)
         raise RuntimeError(f"ffmpeg упал при рендере {output_path.name}:\n{result.stderr[-3000:]}")
-
-    ass_path.unlink(missing_ok=True)
     return output_path

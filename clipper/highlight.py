@@ -1,12 +1,13 @@
 """Отбор лучших отрезков для Reels/Shorts из транскрипта через локальную модель (Ollama)."""
 import json
 from dataclasses import dataclass
+from typing import Any, cast
 
 import requests
 
-from settings import CONFIG
 from clipper.transcribe import Transcript
 from job_control import ollama_generate
+from settings import CONFIG
 
 WORDS_PER_LINE = 8
 MAX_OVERLAP_RATIO = 0.5  # доля пересечения, выше которой отрезок считается дублем уже выбранного
@@ -84,23 +85,25 @@ def pick_highlights(transcript: Transcript) -> list[Highlight]:
     try:
         data = json.loads(raw_text)
     except json.JSONDecodeError as e:
-        raise RuntimeError(f"Не удалось разобрать ответ модели как JSON: {raw_text!r}") from e
+        raise RuntimeError(
+            f"Не удалось разобрать ответ модели как JSON ({len(raw_text)} символов)"
+        ) from e
 
     items = _unwrap_items(data)
     if items is None:
-        raise RuntimeError(f"В ответе модели нет списка отрывков: {raw_text!r}")
+        raise RuntimeError("В ответе модели нет списка отрывков")
 
     video_end = transcript.words[-1].end
     return _validate(items, video_end, cfg)
 
 
-def _unwrap_items(data) -> list | None:
+def _unwrap_items(data: object) -> list[Any] | None:
     """Локальные модели непредсказуемы в обёртке: массив, {"highlights": [...]}, или иной ключ."""
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
         if isinstance(data.get("highlights"), list):
-            return data["highlights"]
+            return cast(list[Any], data["highlights"])
         # запасной вариант: единственное значение-список под любым другим ключом
         list_values = [v for v in data.values() if isinstance(v, list)]
         if len(list_values) == 1:
@@ -130,7 +133,7 @@ def _fit_duration(
     return start, end
 
 
-def _validate(items: list, video_end: float, cfg: dict) -> list["Highlight"]:
+def _validate(items: list[Any], video_end: float, cfg: dict[str, Any]) -> list[Highlight]:
     """Отбрасывает отрезки, которые модель выдумала: неверные типы, нулевую/чрезмерную
     длительность, выход за пределы видео. Слабая локальная модель ошибается регулярно."""
     min_len = cfg["min_segment_seconds"]

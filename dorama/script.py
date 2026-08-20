@@ -1,8 +1,10 @@
 """Оригинальный сценарий и хештеги на основе найденных тренд-сигналов."""
-from dataclasses import dataclass
-from collections import Counter
+# ruff: noqa: ISC004 — длинные абзацы намеренно собраны из соседних строк
 import json
 import re
+from collections import Counter
+from dataclasses import dataclass
+from typing import Any
 
 import requests
 
@@ -28,7 +30,7 @@ CATEGORY_MARKERS = {
 }
 
 
-def _grounded_narration(trends: list[Trend], query: str) -> str:
+def _grounded_narration(trends: list[Trend], query: str, target_words: int = 0) -> str:
     """Фактический текст строится из счётчиков маркеров, а не из догадок модели."""
     titles = [trend.title.lower() for trend in trends]
     counts = {
@@ -91,10 +93,22 @@ def _grounded_narration(trends: list[Trend], query: str) -> str:
         "направление разобрать первым. Мы соберём официальные описания, сравним доступные сведения и подготовим отдельный обзор "
         "без спойлеров и без использования украденных эпизодов."
     ]
+    target_floor = max(45, int(target_words * 0.90))
+    for index, trend in enumerate(trends, start=1):
+        if len(" ".join(paragraphs).split()) >= target_floor:
+            break
+        safe_title = re.sub(r"\s+", " ", trend.title).strip()[:120]
+        view_note = f", открытый счётчик просмотров — {trend.views}" if trend.views > 0 else ""
+        duration_note = f", длительность результата — около {round(trend.duration / 60)} минут" if trend.duration else ""
+        paragraphs.append(
+            f"Поисковый сигнал номер {index}: на площадке {trend.source} найден материал с заголовком «{safe_title}»"
+            f"{view_note}{duration_note}. Мы не считаем этот заголовок подтверждением сюжета или качества сериала. "
+            "Он нужен только для сравнения интереса между площадками; перед рекомендацией сведения проверяются по официальному описанию."
+        )
     return "\n\n".join(paragraphs)
 
 
-def _normalize_hashtags(values: list, base: list[str]) -> list[str]:
+def _normalize_hashtags(values: list[Any], base: list[str]) -> list[str]:
     result: list[str] = []
     for raw in [*base, *values]:
         tag = re.sub(r"[^\wа-яА-ЯёЁ]", "", str(raw).lstrip("#"), flags=re.UNICODE)
@@ -103,7 +117,7 @@ def _normalize_hashtags(values: list, base: list[str]) -> list[str]:
     return result[:10]
 
 
-def _ask_ollama(prompt: str, host: str, model: str) -> dict:
+def _ask_ollama(prompt: str, host: str, model: str) -> dict[str, Any]:
     raw = ollama_generate(
         f"{host.rstrip('/')}/api/generate",
         {
@@ -114,7 +128,10 @@ def _ask_ollama(prompt: str, host: str, model: str) -> dict:
         },
         timeout=600,
     )
-    return json.loads(raw)
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise TypeError("Ollama вернула JSON не в виде объекта")
+    return payload
 
 
 def _ensure_narration_length(text: str) -> str:
@@ -154,9 +171,9 @@ def create_script(trends: list[Trend], query: str) -> DoramaScript:
     except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
         raise RuntimeError(f"Не удалось создать сценарий через Ollama: {exc}") from exc
 
-    title = "Какие китайские дорамы обсуждают в 2026 году"
-    narration = _grounded_narration(trends, query)
-    caption = "Радар интереса: какие направления китайских дорам чаще встречаются в свежей поисковой выдаче."
+    title = f"Дорама-радар: {query}"[:70]
+    narration = _grounded_narration(trends, query, int(cfg.get("target_script_words", 680)))
+    caption = f"Радар интереса по теме «{query}»: направления, которые чаще встречаются в свежей выдаче."[:180]
     if len(narration.split()) < 45:
         raise RuntimeError("Не удалось сформировать достаточно длинный сценарий")
     hashtags = _normalize_hashtags(data.get("hashtags") or [], cfg["base_hashtags"])

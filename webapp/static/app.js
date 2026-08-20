@@ -4,6 +4,7 @@ const state = {
   selectedClipId: null,
   uploadFile: null,
   busy: false,
+  csrfToken: null,
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -19,7 +20,19 @@ function escapeHtml(value = "") {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, options);
+  const method = String(options.method || "GET").toUpperCase();
+  const requestOptions = { ...options };
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
+    if (!state.csrfToken) {
+      const session = await fetch("/api/session", { cache: "no-store" });
+      if (!session.ok) throw new Error("Не удалось открыть защищённую API-сессию");
+      state.csrfToken = (await session.json()).csrf_token;
+    }
+    const headers = new Headers(requestOptions.headers || {});
+    headers.set("X-Dorama-CSRF", state.csrfToken);
+    requestOptions.headers = headers;
+  }
+  const response = await fetch(path, requestOptions);
   if (!response.ok) {
     let message = `Ошибка ${response.status}`;
     try {
@@ -156,7 +169,12 @@ function renderQueue(clips) {
 }
 
 function clipStatus(status) {
-  return { pending: "На проверке", posted: "Опубликовано", rejected: "Отклонено" }[status] || status;
+  return {
+    pending: "На проверке",
+    publishing: "Публикуется",
+    posted: "Опубликовано",
+    rejected: "Отклонено",
+  }[status] || status;
 }
 
 async function refresh({ silent = false } = {}) {
@@ -316,8 +334,71 @@ $$('[data-filter]').forEach(button => button.addEventListener("click", () => {
   renderQueue(state.dashboard?.clips || []);
 }));
 
-$("#settingsButton").addEventListener("click", () => $("#settingsDialog").showModal());
+async function loadPipelineSettings() {
+  try {
+    const s = await api("/api/settings/pipeline");
+    $("#setWhisperModel").value = s.whisper_model;
+    $("#setWhisperDevice").value = s.whisper_device;
+    $("#setOllamaModel").value = s.ollama_model;
+    $("#setVoice").value = s.voice;
+    $("#setRate").value = s.rate;
+    $("#setPitch").value = s.pitch;
+    $("#setDuration").value = String(s.target_duration_seconds);
+    $("#setSceneCount").value = String(s.scene_count);
+    $("#setVolume").value = s.original_audio_volume;
+    $("#setVolumeLabel").textContent = String(s.original_audio_volume);
+    $("#setScriptWords").value = s.target_script_words;
+    $("#setRequireReview").checked = s.require_review;
+    const sources = new Set(s.search_sources);
+    $$('input[name="source"]', $("#setSourcesGroup")).forEach(cb => { cb.checked = sources.has(cb.value); });
+  } catch (_) {}
+}
+
+$("#setVolume").addEventListener("input", () => { $("#setVolumeLabel").textContent = $("#setVolume").value; });
+
+$$('[data-settings-tab]').forEach(tab => tab.addEventListener("click", () => {
+  $$('[data-settings-tab]').forEach(t => t.classList.toggle("active", t === tab));
+  $$('[data-settings-section]').forEach(s => s.classList.toggle("active", s.dataset.settingsSection === tab.dataset.settingsTab));
+}));
+
+$("#openSettingsButton").addEventListener("click", async () => {
+  await loadPipelineSettings();
+  $("#settingsDialog").showModal();
+});
+
 $("#settingsForm").addEventListener("submit", async event => {
+  event.preventDefault();
+  const sources = [...$$('input[name="source"]:checked', $("#setSourcesGroup"))].map(cb => cb.value);
+  if (!sources.length) { toast("Выберите хотя бы один источник поиска", "error"); return; }
+  try {
+    await api("/api/settings/pipeline", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        whisper_model: $("#setWhisperModel").value,
+        whisper_device: $("#setWhisperDevice").value,
+        ollama_model: $("#setOllamaModel").value,
+        search_sources: sources,
+        voice: $("#setVoice").value,
+        rate: $("#setRate").value,
+        pitch: $("#setPitch").value,
+        target_duration_seconds: Number($("#setDuration").value),
+        scene_count: Number($("#setSceneCount").value),
+        original_audio_volume: Number($("#setVolume").value),
+        target_script_words: Number($("#setScriptWords").value),
+        require_review: $("#setRequireReview").checked,
+      }),
+    });
+    $("#settingsDialog").close();
+    toast("Настройки пайплайна сохранены");
+    await refresh();
+  } catch (error) {
+    toast(error.message, "error");
+  }
+});
+
+$("#ytSettingsButton").addEventListener("click", () => $("#ytScheduleDialog").showModal());
+$("#ytScheduleForm").addEventListener("submit", async event => {
   event.preventDefault();
   const postTimes = $("#scheduleTimes").value.split(",").map(item => item.trim()).filter(Boolean);
   const privacy = $("#schedulePrivacy").value;
@@ -328,7 +409,7 @@ $("#settingsForm").addEventListener("submit", async event => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enabled: $("#scheduleEnabled").checked, post_times: postTimes, privacy_status: privacy }),
     });
-    $("#settingsDialog").close();
+    $("#ytScheduleDialog").close();
     toast("Расписание YouTube сохранено");
     await refresh();
   } catch (error) { toast(error.message, "error"); }

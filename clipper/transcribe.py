@@ -1,13 +1,12 @@
 """Транскрибация видео с CUDA fallback и дисковым кэшем результата."""
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
 import sys
-
+from dataclasses import dataclass
+from pathlib import Path
 
 _cuda_dll_handles: list[object] = []
 
@@ -32,10 +31,13 @@ def _configure_cuda_dlls() -> None:
 
 _configure_cuda_dlls()
 
-from faster_whisper import WhisperModel  # noqa: E402 — CUDA DLL должны быть подключены раньше
+from faster_whisper import (  # type: ignore[import-untyped]
+    WhisperModel,
+)
 
 from job_control import checkpoint
 from settings import CACHE_DIR, CONFIG
+from storage.files import atomic_write_text
 
 _model_cache: dict[tuple[str, str, str], WhisperModel] = {}
 CACHE_VERSION = 1
@@ -89,7 +91,7 @@ def _transcript_cache_key(video_path: str | Path, language: str | None) -> str:
 
 
 def _cache_path(video_path: str | Path, language: str | None) -> Path:
-    return CACHE_DIR / "transcripts" / f"{_transcript_cache_key(video_path, language)}.json"
+    return Path(CACHE_DIR) / "transcripts" / f"{_transcript_cache_key(video_path, language)}.json"
 
 
 def _load_cached_transcript(video_path: str | Path, language: str | None) -> Transcript | None:
@@ -115,7 +117,6 @@ def _load_cached_transcript(video_path: str | Path, language: str | None) -> Tra
 def _save_cached_transcript(video_path: str | Path, language: str | None, transcript: Transcript) -> None:
     path = _cache_path(video_path, language)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
     payload = {
         "version": CACHE_VERSION,
         "full_text": transcript.full_text,
@@ -124,8 +125,7 @@ def _save_cached_transcript(video_path: str | Path, language: str | None, transc
             for word in transcript.words
         ],
     }
-    temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    temporary.replace(path)
+    atomic_write_text(path, json.dumps(payload, ensure_ascii=False))
 
 
 def _is_cuda_failure(exc: Exception) -> bool:

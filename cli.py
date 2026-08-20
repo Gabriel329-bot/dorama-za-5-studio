@@ -1,10 +1,10 @@
 """Точка входа: python cli.py clip <video> | publish | status"""
 import argparse
-import shutil
 import sys
 from pathlib import Path
 
 from storage import db
+from storage.files import move_to_unique
 
 
 def cmd_clip(args: argparse.Namespace) -> None:
@@ -37,24 +37,44 @@ def cmd_reject(args: argparse.Namespace) -> None:
     from settings import REJECTED_DIR
 
     db.init_db()
-    clip = db.get_clip(args.id)
+    clip = db.claim_pending("cli-reject", clip_id=args.id)
     if clip is None:
-        raise RuntimeError(f"Запись #{args.id} не найдена")
-    if clip["status"] != "pending":
-        raise RuntimeError(f"Запись #{args.id} уже имеет статус {clip['status']}")
+        raise RuntimeError(f"Запись #{args.id} не найдена или уже обрабатывается")
+    claim_token = str(clip["claim_token"])
     source = Path(clip["file_path"])
-    REJECTED_DIR.mkdir(parents=True, exist_ok=True)
-    destination = REJECTED_DIR / source.name
-    if source.is_file():
-        shutil.move(str(source), str(destination))
-    db.mark_rejected(args.id, str(destination))
+    destination = source
+    moved = False
+    try:
+        if source.is_file():
+            destination = move_to_unique(source, REJECTED_DIR)
+            moved = True
+        db.mark_rejected_claimed(args.id, claim_token, str(destination))
+    except BaseException as exc:
+        if moved and destination.is_file() and not source.exists():
+            destination.replace(source)
+            moved = False
+        if not moved:
+            db.release_claim(args.id, claim_token, str(exc))
+        raise
     print(f"Ролик #{args.id} отклонён и перемещён в {REJECTED_DIR}")
+
+
+def cmd_recover(args: argparse.Namespace) -> None:
+    """Вернуть аварийный claim только после ручной сверки внешней платформы."""
+    db.init_db()
+    if not args.confirmed_not_published:
+        raise RuntimeError(
+            "Сначала проверьте YouTube/Telegram и добавьте --confirmed-not-published"
+        )
+    if not db.recover_interrupted_claim(args.id):
+        raise RuntimeError(f"Ролик #{args.id} не находится в статусе publishing")
+    print(f"Ролик #{args.id} возвращён в pending")
 
 
 def cmd_doctor(args: argparse.Namespace) -> None:
     """Проверить локальные зависимости без публикации и обработки видео."""
+    import imageio_ffmpeg  # type: ignore[import-untyped]
     import requests
-    import imageio_ffmpeg
 
     from settings import (
         CONFIG,
@@ -141,6 +161,7 @@ def cmd_youtube_auth(args: argparse.Namespace) -> None:
 
 def cmd_youtube_preview(args: argparse.Namespace) -> None:
     import json
+
     from publisher import youtube
 
     print(json.dumps(youtube.preview(args.id), ensure_ascii=False, indent=2))
@@ -173,6 +194,18 @@ def main() -> None:
     p_reject = sub.add_parser("reject", help="Отклонить ролик из очереди проверки")
     p_reject.add_argument("id", type=int, help="ID ролика из команды status")
     p_reject.set_defaults(func=cmd_reject)
+
+    p_recover = sub.add_parser(
+        "recover",
+        help="Вернуть зависший publishing после проверки внешней платформы",
+    )
+    p_recover.add_argument("id", type=int, help="ID ролика из команды status")
+    p_recover.add_argument(
+        "--confirmed-not-published",
+        action="store_true",
+        help="подтверждение, что видео/сообщение не появилось на платформе",
+    )
+    p_recover.set_defaults(func=cmd_recover)
 
     p_doctor = sub.add_parser("doctor", help="Проверить ffmpeg, Ollama, модель и настройки")
     p_doctor.set_defaults(func=cmd_doctor)
@@ -214,7 +247,7 @@ def main() -> None:
     args = parser.parse_args()
     try:
         args.func(args)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — человекочитаемая граница CLI
         print(f"Ошибка: {e}", file=sys.stderr)
         sys.exit(1)
 

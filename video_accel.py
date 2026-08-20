@@ -1,9 +1,9 @@
 """Выбор доступного H.264-кодировщика с проверкой реального запуска."""
 from __future__ import annotations
 
-from functools import lru_cache
+from functools import cache, lru_cache
 
-import imageio_ffmpeg
+import imageio_ffmpeg  # type: ignore[import-untyped]
 
 from job_control import run_process
 from settings import CONFIG
@@ -52,7 +52,7 @@ def _listed_encoders() -> set[str]:
     }
 
 
-@lru_cache(maxsize=None)
+@cache
 def _probe_encoder(encoder: str) -> bool:
     if encoder not in _listed_encoders():
         return False

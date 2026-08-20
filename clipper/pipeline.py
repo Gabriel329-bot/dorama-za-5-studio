@@ -1,13 +1,14 @@
 """Склейка: видео -> транскрипт -> хайлайты -> вертикальные клипы с субтитрами -> очередь."""
 import re
+import uuid
 from pathlib import Path
 
-from settings import PENDING_DIR
-from clipper.transcribe import transcribe
 from clipper.highlight import pick_highlights
 from clipper.render import render_clip
-from storage import db
+from clipper.transcribe import transcribe
 from job_control import checkpoint
+from settings import PENDING_DIR
+from storage import db
 
 
 def _slugify(text: str, max_len: int = 40) -> str:
@@ -40,7 +41,7 @@ def process_video(video_path: str) -> list[Path]:
     for idx, hl in enumerate(highlights, start=1):
         checkpoint()
         slug = _slugify(hl.caption)
-        out_name = f"{source.stem}_{idx}_{slug}.mp4"
+        out_name = f"{source.stem}_{idx}_{slug}_{uuid.uuid4().hex[:8]}.mp4"
         out_path = PENDING_DIR / out_name
 
         render_clip(str(source), hl, transcript.words, out_path)

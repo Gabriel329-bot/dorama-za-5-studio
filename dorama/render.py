@@ -1,17 +1,15 @@
 """Рендер оригинальной карточки 9:16 с озвучкой и субтитрами."""
-from pathlib import Path
 import os
 import re
-import subprocess
 import textwrap
+from pathlib import Path
 
-import imageio_ffmpeg
+import imageio_ffmpeg  # type: ignore[import-untyped]
 from PIL import Image, ImageDraw, ImageFont
 
 from clipper.render import _ass_escape_path, _fmt_ass_time
 from job_control import run_process
 from video_accel import selected_encoder_options
-from settings import CONFIG
 
 
 def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -100,9 +98,11 @@ def _audio_duration(audio_path: Path) -> float:
 def _fit_audio(audio_path: Path, target_duration: float, output_path: Path) -> Path:
     source_duration = _audio_duration(audio_path)
     factor = source_duration / target_duration
-    if not 0.5 <= factor <= 2.0:
+    if factor < 0.80 or factor > 1.25:
         raise RuntimeError(
-            f"Озвучка длится {source_duration:.0f}с и не может быть естественно приведена к {target_duration:.0f}с"
+            f"Озвучка длится {source_duration:.0f}с — приведение к {target_duration:.0f}с "
+            f"(коэффициент {factor:.2f}) ухудшит качество голоса. "
+            f"Измените целевое число слов, чтобы коэффициент был от 0.80 до 1.25."
         )
     result = run_process(
         [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", str(audio_path), "-filter:a", f"atempo={factor:.6f}", str(output_path)],
@@ -140,9 +140,15 @@ def render_video(
         *encoder_args,
         "-c:a", "aac", "-b:a", "160k", "-pix_fmt", "yuv420p", "-shortest", str(output_path),
     ]
-    result = run_process(command, capture_output=True, text=True)
-    ass_path.unlink(missing_ok=True)
-    fitted_audio.unlink(missing_ok=True)
+    try:
+        result = run_process(command, capture_output=True, text=True)
+    except BaseException:
+        output_path.unlink(missing_ok=True)
+        raise
+    finally:
+        ass_path.unlink(missing_ok=True)
+        fitted_audio.unlink(missing_ok=True)
     if result.returncode != 0:
+        output_path.unlink(missing_ok=True)
         raise RuntimeError(f"ffmpeg не смог собрать дорама-ролик:\n{result.stderr[-2500:]}")
     return output_path

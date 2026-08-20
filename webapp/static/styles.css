@@ -288,6 +288,24 @@ footer > span { text-align: right; }
 .toggle-row input { width: 38px; height: 20px; accent-color: var(--jade); }
 .settingsForm label + label, #settingsForm label + label { margin-top: 14px; }
 .warning-note { padding: 12px; border: 1px solid rgba(224,107,114,.18); border-radius: 10px; background: rgba(224,107,114,.05); }
+.settings-modal { width: min(620px, calc(100% - 32px)); }
+.settings-modal label + label { margin-top: 12px; }
+.settings-modal label { display: block; text-transform: none; letter-spacing: 0; }
+.settings-modal label > span { display: block; font-size: 11px; font-weight: 600; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .12em; }
+.settings-modal select, .settings-modal input[type="number"] { width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); color: var(--text); font-size: 13px; }
+.settings-modal input[type="range"] { width: calc(100% - 50px); accent-color: var(--gold); }
+.settings-tabs { display: flex; gap: 4px; margin: 18px 0 14px; padding: 4px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.settings-tab { flex: 1; padding: 8px 4px; border: 0; border-radius: 9px; background: transparent; color: var(--muted); font-size: 12px; font-weight: 600; cursor: pointer; transition: all .15s; }
+.settings-tab.active { background: var(--surface-3); color: var(--text); }
+.settings-tab:hover:not(.active) { color: var(--text); }
+.settings-section { display: none; }
+.settings-section.active { display: block; }
+.checkbox-group { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
+.checkbox-pill { display: inline-flex; }
+.checkbox-pill input { display: none; }
+.checkbox-pill span { display: inline-block; padding: 6px 12px; border: 1px solid var(--line); border-radius: 8px; font-size: 11px; font-weight: 600; cursor: pointer; transition: all .15s; }
+.checkbox-pill input:checked + span { border-color: var(--gold); background: rgba(214,173,99,.1); color: var(--gold-soft); }
+.checkbox-pill input:not(:checked) + span { color: var(--muted); }
 .preview-modal { width: min(460px, calc(100% - 32px)); }
 .preview-modal video { width: 100%; max-height: 62vh; background: #000; border-radius: 13px; margin-top: 12px; }
 .toast-stack { position: fixed; right: 22px; bottom: 22px; z-index: 100; display: grid; gap: 10px; }

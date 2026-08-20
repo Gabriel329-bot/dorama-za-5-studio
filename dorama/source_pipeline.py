@@ -1,15 +1,17 @@
 """Лицензированная серия -> сцены -> русский пересказ -> озвучка -> ролик 5 минут."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from datetime import datetime
-from pathlib import Path
 import asyncio
 import json
 import re
-import subprocess
+import tempfile
+import uuid
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
-import imageio_ffmpeg
+import imageio_ffmpeg  # type: ignore[import-untyped]
 import requests
 
 from clipper.render import _ass_escape_path
@@ -17,9 +19,10 @@ from clipper.transcribe import Transcript, Word, transcribe
 from dorama.render import _fit_audio, create_subtitles
 from dorama.script import _normalize_hashtags
 from dorama.speech import synthesize
+from job_control import checkpoint, ollama_generate, run_process
 from settings import CONFIG, PENDING_DIR
 from storage import db
-from job_control import checkpoint, ollama_generate, run_process
+from storage.files import atomic_write_text
 from video_accel import selected_encoder_options
 
 
@@ -53,6 +56,11 @@ class EpisodePlan:
 def _slug(text: str) -> str:
     value = re.sub(r"[^\wа-яА-ЯёЁ-]+", "_", text, flags=re.UNICODE).strip("_")
     return value[:52] or "licensed_dorama"
+
+
+def _artifact_id() -> str:
+    now = datetime.now(timezone.utc).astimezone()
+    return f"{now:%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
 
 
 def _video_duration(path: Path) -> float:
@@ -92,7 +100,7 @@ def _make_timeline(words: list[Word], bucket_seconds: int = 75, max_chars: int =
     return [items[index] for index in indexes]
 
 
-def _ask_ollama(prompt: str) -> dict:
+def _ask_ollama(prompt: str) -> dict[str, Any]:
     cfg = CONFIG["highlight"]
     raw = ollama_generate(
         f"{cfg['ollama_host'].rstrip('/')}/api/generate",
@@ -104,10 +112,32 @@ def _ask_ollama(prompt: str) -> dict:
         },
         timeout=900,
     )
+    return _parse_json_response(raw)
+
+
+def _parse_json_response(raw: str) -> dict[str, Any]:
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        cleaned = "\n".join(lines).strip()
     try:
-        return json.loads(raw)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("Локальная модель вернула некорректный план пересказа") from exc
+        payload = json.loads(cleaned)
+        if isinstance(payload, dict):
+            return payload
+    except (TypeError, json.JSONDecodeError):
+        pass
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(cleaned):
+        if character != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(cleaned[index:])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            return value
+    raise RuntimeError("Локальная модель вернула некорректный план пересказа")
 
 
 def _fallback_scenes(duration: float, count: int) -> list[SourceScene]:
@@ -123,7 +153,7 @@ def _fallback_scenes(duration: float, count: int) -> list[SourceScene]:
     return result
 
 
-def _validate_scenes(raw_scenes: list, duration: float, desired_count: int = 9) -> list[SourceScene]:
+def _validate_scenes(raw_scenes: list[Any], duration: float, desired_count: int = 9) -> list[SourceScene]:
     result: list[SourceScene] = []
     for raw in raw_scenes or []:
         if not isinstance(raw, dict):
@@ -170,12 +200,13 @@ def _build_sequence(scenes: list[SourceScene], target_duration: float) -> list[S
 
 
 def _expand_narration(narration: str, timeline: list[TimelineItem], focus: str, target_words: int) -> str:
-    if len(narration.split()) >= max(360, int(target_words * 0.68)):
+    if len(narration.split()) >= target_words:
         return narration.strip()
-    prompt = f"""Расширь русский закадровый пересказ до {target_words} слов.
+    prompt = f"""Перепиши и расширь русский закадровый пересказ до {target_words} слов, допустимое отклонение не больше 5 процентов.
 Сохрани факты только из расшифровки. Не придумывай имена, события и финал.
 Фокус: {focus or 'последовательный пересказ без спойлеров'}.
-Черновик: {narration}
+Можно подробнее связать уже упомянутые события и объяснить последовательность действий, но нельзя описывать то, чего нет в расшифровке.
+Черновик ({len(narration.split())} слов): {narration}
 Расшифровка по времени: {json.dumps([asdict(item) for item in timeline], ensure_ascii=False)}
 Верни JSON: {{"narration":"текст"}}. Без markdown."""
     expanded = _ask_ollama(prompt).get("narration")
@@ -205,17 +236,33 @@ def _create_plan(transcript: Transcript, duration: float, source_name: str, focu
   "scenes":[{{"start":12.0,"end":45.0,"reason":"что видно или слышно"}}]
 }}
 Выбери {cfg['scene_count']} хронологических сцен по 15–50 секунд. Без markdown."""
-    try:
-        data = _ask_ollama(prompt)
-    except (requests.RequestException, ValueError) as exc:
-        raise RuntimeError(f"Не удалось подготовить пересказ через Ollama: {exc}") from exc
+    data = None
+    for attempt in range(2):
+        try:
+            data = _ask_ollama(prompt)
+            break
+        except (RuntimeError, requests.RequestException, ValueError) as exc:
+            if attempt == 0:
+                print(f"  Повторная попытка генерации плана… ({exc})")
+                continue
+            raise RuntimeError(f"Не удалось подготовить пересказ через Ollama: {exc}") from exc
+    if data is None:
+        raise RuntimeError("Не удалось подготовить пересказ через Ollama")
 
     title = str(data.get("title") or f"Короткий пересказ: {Path(source_name).stem}").strip()[:100]
     caption = str(data.get("caption") or title).strip()[:500]
     narration = str(data.get("narration") or "").strip()
-    if len(narration.split()) < 80:
-        raise RuntimeError("Модель не смогла подготовить достаточно подробный пересказ")
-    narration = _expand_narration(narration, timeline, focus, int(cfg["target_narration_words"]))
+    target_words = int(cfg["target_narration_words"])
+    narration = narration or title
+    for _ in range(3):
+        if len(narration.split()) >= int(target_words * 0.88):
+            break
+        narration = _expand_narration(narration, timeline, focus, target_words)
+    if len(narration.split()) < int(target_words * 0.82):
+        raise RuntimeError(
+            f"Модель подготовила только {len(narration.split())} слов из целевых {target_words}; "
+            "озвучка не будет искусственно замедлена"
+        )
     scenes = _validate_scenes(data.get("scenes") or [], duration, int(cfg["scene_count"]))
     hashtags = _normalize_hashtags(data.get("hashtags") or [], CONFIG["dorama"]["base_hashtags"])
     return EpisodePlan(title, caption, narration, hashtags, scenes)
@@ -279,10 +326,16 @@ def _render_montage(
             "-t", f"{target_duration:.3f}", str(output_path),
         ]
     )
-    result = run_process(command, capture_output=True, text=True)
-    subtitle_path.unlink(missing_ok=True)
-    fitted_audio.unlink(missing_ok=True)
+    try:
+        result = run_process(command, capture_output=True, text=True)
+    except BaseException:
+        output_path.unlink(missing_ok=True)
+        raise
+    finally:
+        subtitle_path.unlink(missing_ok=True)
+        fitted_audio.unlink(missing_ok=True)
     if result.returncode != 0:
+        output_path.unlink(missing_ok=True)
         raise RuntimeError(f"ffmpeg не смог собрать пятиминутный пересказ:\n{result.stderr[-3500:]}")
     return output_path
 
@@ -290,7 +343,7 @@ def _render_montage(
 def create_episode_recap(
     source_video: str | Path,
     focus: str = "",
-    source_info: dict | None = None,
+    source_info: dict[str, Any] | None = None,
     progress_offset: int = 0,
 ) -> Path:
     cfg = CONFIG["episode"]
@@ -299,79 +352,116 @@ def create_episode_recap(
         raise FileNotFoundError(f"Исходное видео не найдено: {source}")
     if source.suffix.lower() not in {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}:
         raise ValueError(f"Неподдерживаемый формат: {source.suffix}")
+    selected_focus = focus.strip()
+    if len(selected_focus) > 300:
+        raise ValueError("Фокус пересказа не должен превышать 300 символов")
+    if not 0 <= progress_offset <= 20:
+        raise ValueError("Некорректное смещение прогресса")
 
     target_duration = float(cfg["target_duration_seconds"])
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    work_dir = PENDING_DIR / ".work" / f"episode_{stamp}"
-    work_dir.mkdir(parents=True, exist_ok=True)
-
+    artifact_id = _artifact_id()
+    work_root = PENDING_DIR / ".work"
+    work_root.mkdir(parents=True, exist_ok=True)
+    PENDING_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = PENDING_DIR / f"{artifact_id}_{_slug(source.stem)}.mp4"
+    audit_path = output_path.with_suffix(".plan.json")
     total_steps = 5 + progress_offset
-    print(f"[{1 + progress_offset}/{total_steps}] Анализирую длительность {source.name}...")
-    checkpoint()
-    duration = _video_duration(source)
-    if duration < 20:
-        raise RuntimeError("Исходник слишком короткий: нужно хотя бы 20 секунд")
+    try:
+        with tempfile.TemporaryDirectory(prefix=f"episode_{artifact_id}_", dir=work_root) as temporary:
+            work_dir = Path(temporary)
+            print(
+                f"[{1 + progress_offset}/{total_steps}] "
+                f"Анализирую длительность {source.name}..."
+            )
+            checkpoint()
+            duration = _video_duration(source)
+            if duration < 20:
+                raise RuntimeError("Исходник слишком короткий: нужно хотя бы 20 секунд")
 
-    print(f"[{2 + progress_offset}/{total_steps}] Распознаю речь и строю таймлайн...")
-    checkpoint()
-    transcript = transcribe(str(source), language=str(cfg.get("source_language", "auto")))
-    print(f"  Распознано {len(transcript.words)} слов")
+            print(
+                f"[{2 + progress_offset}/{total_steps}] "
+                "Распознаю речь и строю таймлайн..."
+            )
+            checkpoint()
+            transcript = transcribe(
+                str(source), language=str(cfg.get("source_language", "auto"))
+            )
+            print(f"  Распознано {len(transcript.words)} слов")
 
-    print(f"[{3 + progress_offset}/{total_steps}] Выбираю ключевые сцены и пишу русский пересказ...")
-    checkpoint()
-    plan = _create_plan(transcript, duration, source.name, focus)
-    audio_path = work_dir / "voice.mp3"
-    print(f"[{4 + progress_offset}/{total_steps}] Озвучиваю: {plan.title}")
-    checkpoint()
-    asyncio.run(
-        synthesize(
-            plan.narration,
-            audio_path,
-            CONFIG["dorama"]["voice"],
-            CONFIG["dorama"]["rate"],
+            print(
+                f"[{3 + progress_offset}/{total_steps}] "
+                "Выбираю ключевые сцены и пишу русский пересказ..."
+            )
+            checkpoint()
+            plan = _create_plan(transcript, duration, source.name, selected_focus)
+            audio_path = work_dir / "voice.mp3"
+            print(f"[{4 + progress_offset}/{total_steps}] Озвучиваю: {plan.title}")
+            checkpoint()
+            asyncio.run(
+                synthesize(
+                    plan.narration,
+                    audio_path,
+                    CONFIG["dorama"]["voice"],
+                    CONFIG["dorama"]["rate"],
+                )
+            )
+
+            output_path = PENDING_DIR / f"{artifact_id}_{_slug(plan.title)}.mp4"
+            audit_path = output_path.with_suffix(".plan.json")
+            print(
+                f"[{5 + progress_offset}/{total_steps}] "
+                "Монтирую сцены, голос и субтитры..."
+            )
+            checkpoint()
+            _render_montage(
+                source,
+                plan.scenes,
+                audio_path,
+                plan.narration,
+                output_path,
+                target_duration,
+            )
+
+        attribution = ""
+        source_ref = f"licensed-file:{source}"
+        if source_info:
+            source_title = str(source_info.get("title") or source.name)
+            source_channel = str(source_info.get("channel") or "Неизвестный автор")
+            source_url = str(source_info.get("url") or "")
+            source_license = str(source_info.get("license") or "Разрешённый источник")
+            attribution = (
+                f"\n\nИсточник видеоматериала: {source_title} — {source_channel}"
+                f"\n{source_url}\nЛицензия: {source_license}"
+            )
+            source_ref = f"licensed-url:{source_url}"
+        caption = f"{plan.caption}\n\n{' '.join(plan.hashtags)}{attribution}".strip()
+        atomic_write_text(
+            audit_path,
+            json.dumps(
+                {
+                    "source": str(source),
+                    "source_info": source_info,
+                    "duration": duration,
+                    "transcript_words": len(transcript.words),
+                    "focus": selected_focus,
+                    "title": plan.title,
+                    "caption": plan.caption,
+                    "hashtags": plan.hashtags,
+                    "narration": plan.narration,
+                    "scenes": [asdict(scene) for scene in plan.scenes],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
         )
-    )
+        checkpoint()
+        db.init_db()
+        db.add_pending(str(output_path), caption, source_ref)
+    except BaseException:
+        output_path.unlink(missing_ok=True)
+        audit_path.unlink(missing_ok=True)
+        raise
 
-    output_path = PENDING_DIR / f"{stamp}_{_slug(plan.title)}.mp4"
-    print(f"[{5 + progress_offset}/{total_steps}] Монтирую сцены, голос и субтитры...")
-    checkpoint()
-    _render_montage(source, plan.scenes, audio_path, plan.narration, output_path, target_duration)
-
-    attribution = ""
-    source_ref = f"licensed-file:{source}"
-    if source_info:
-        source_title = str(source_info.get("title") or source.name)
-        source_channel = str(source_info.get("channel") or "Неизвестный автор")
-        source_url = str(source_info.get("url") or "")
-        source_license = str(source_info.get("license") or "Разрешённый источник")
-        attribution = (
-            f"\n\nИсточник видеоматериала: {source_title} — {source_channel}"
-            f"\n{source_url}\nЛицензия: {source_license}"
-        )
-        source_ref = f"licensed-url:{source_url}"
-    caption = f"{plan.caption}\n\n{' '.join(plan.hashtags)}{attribution}".strip()
-    checkpoint()
-    db.init_db()
-    db.add_pending(str(output_path), caption, source_ref)
-    (work_dir / "plan.json").write_text(
-        json.dumps(
-            {
-                "source": str(source),
-                "source_info": source_info,
-                "duration": duration,
-                "focus": focus,
-                "title": plan.title,
-                "caption": plan.caption,
-                "hashtags": plan.hashtags,
-                "narration": plan.narration,
-                "scenes": [asdict(scene) for scene in plan.scenes],
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    (work_dir / "transcript.txt").write_text(transcript.full_text, encoding="utf-8")
     print(f"Готово: {output_path.name}")
     print("Ролик добавлен в очередь проверки и не опубликован автоматически до следующего слота.")
-    return output_path
+    return Path(output_path)

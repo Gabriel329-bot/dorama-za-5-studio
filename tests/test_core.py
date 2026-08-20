@@ -1,10 +1,10 @@
-import tempfile
 import sys
+import tempfile
 import time
 import unittest
-from unittest.mock import patch
 from pathlib import Path
 from threading import Event, Timer
+from unittest.mock import patch
 
 from clipper.highlight import Highlight, _fit_duration, _overlaps_existing, _validate
 from clipper.render import _build_ass, _fmt_ass_time
@@ -17,22 +17,37 @@ from clipper.transcribe import (
     _transcript_cache_key,
 )
 from dorama.discover import _parse_search, is_relevant, parse_duration, query_variants
-from dorama.render import _sentences
-from dorama.script import _ensure_narration_length, _grounded_narration, _normalize_hashtags
-from dorama.speech import normalize_russian_text, split_for_tts, transcript_similarity
-from dorama.source_pipeline import SourceScene, _build_sequence, _make_timeline, _validate_scenes
 from dorama.licensed_sources import (
     LicensedCandidate,
-    _candidate_from_metadata,
     _cached_download,
-    _permission_basis,
+    _candidate_from_metadata,
     _open_license_basis,
+    _permission_basis,
     _relevance_score,
     _score_candidate,
 )
-from video_accel import encoder_options
+from dorama.render import _sentences
+from dorama.script import (
+    _ensure_narration_length,
+    _grounded_narration,
+    _normalize_hashtags,
+)
+from dorama.source_pipeline import (
+    SourceScene,
+    _build_sequence,
+    _make_timeline,
+    _validate_scenes,
+)
+from dorama.speech import normalize_russian_text, split_for_tts, transcript_similarity
+from job_control import (
+    JobCancelled,
+    cancellation_scope,
+    checkpoint,
+    ollama_generate,
+    run_process,
+)
 from publisher.youtube import build_metadata
-from job_control import JobCancelled, cancellation_scope, checkpoint, ollama_generate, run_process
+from video_accel import encoder_options
 
 
 class HighlightValidationTests(unittest.TestCase):
@@ -203,16 +218,16 @@ class DoramaTests(unittest.TestCase):
         self.assertIsNone(_open_license_basis("", "https://creativecommons.org/licenses/by-nd/4.0/"))
 
     def test_licensed_search_prefers_relevant_result(self):
-        common = dict(
-            video_id="a",
-            channel="Author",
-            channel_id="UC1",
-            url="https://example.com/a",
-            duration=180,
-            views=100,
-            license="Creative Commons Attribution license (reuse allowed)",
-            permission_basis="youtube-creative-commons",
-        )
+        common = {
+            "video_id": "a",
+            "channel": "Author",
+            "channel_id": "UC1",
+            "url": "https://example.com/a",
+            "duration": 180,
+            "views": 100,
+            "license": "Creative Commons Attribution license (reuse allowed)",
+            "permission_basis": "youtube-creative-commons",
+        }
         relevant = LicensedCandidate(title="Китайская историческая дорама", description="романтика", **common)
         unrelated = LicensedCandidate(title="Action stock footage", description="cars", **common)
         self.assertGreater(_score_candidate(relevant, "историческая дорама"), _score_candidate(unrelated, "историческая дорама"))
@@ -295,7 +310,7 @@ class JobCancellationTests(unittest.TestCase):
 
         def iter_lines(self):
             time.sleep(self.delay)
-            yield '{"response":"готово","done":true}'.encode("utf-8")
+            yield '{"response":"готово","done":true}'.encode()
 
         def close(self):
             self.closed = True
@@ -329,10 +344,12 @@ class JobCancellationTests(unittest.TestCase):
         timer.start()
         started = time.monotonic()
         try:
-            with patch("job_control.requests.Session", return_value=session):
-                with self.assertRaises(JobCancelled):
-                    with cancellation_scope(event):
-                        ollama_generate("http://ollama/api/generate", {"model": "test"}, timeout=5)
+            with (
+                patch("job_control.requests.Session", return_value=session),
+                self.assertRaises(JobCancelled),
+                cancellation_scope(event),
+            ):
+                ollama_generate("http://ollama/api/generate", {"model": "test"}, timeout=5)
         finally:
             timer.cancel()
         self.assertLess(time.monotonic() - started, 1)
@@ -372,9 +389,8 @@ class JobCancellationTests(unittest.TestCase):
         timer = Timer(0.2, event.set)
         timer.start()
         started = time.monotonic()
-        with self.assertRaises(JobCancelled):
-            with cancellation_scope(event):
-                run_process([sys.executable, "-c", "import time; time.sleep(30)"], timeout=35)
+        with self.assertRaises(JobCancelled), cancellation_scope(event):
+            run_process([sys.executable, "-c", "import time; time.sleep(30)"], timeout=35)
         timer.cancel()
         self.assertLess(time.monotonic() - started, 4)
 

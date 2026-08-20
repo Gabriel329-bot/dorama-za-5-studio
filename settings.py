@@ -1,9 +1,9 @@
 """Загрузка config.yaml и .env в одном месте, чтобы остальные модули не дублировали эту логику."""
+import os
 from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
-import os
 
 ROOT_DIR = Path(__file__).resolve().parent
 
@@ -14,6 +14,10 @@ with open(ROOT_DIR / "config.yaml", "r", encoding="utf-8") as f:
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "")
+try:
+    TELEGRAM_USER_ID = int(os.environ.get("TELEGRAM_USER_ID", "0"))
+except ValueError:
+    TELEGRAM_USER_ID = 0
 
 INPUT_DIR = ROOT_DIR / CONFIG["paths"]["input_dir"]
 PENDING_DIR = ROOT_DIR / CONFIG["paths"]["pending_dir"]
