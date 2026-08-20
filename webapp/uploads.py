@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import uuid
 from pathlib import Path
 from typing import BinaryIO
+
+import imageio_ffmpeg  # type: ignore[import-untyped]
+
+from job_control import run_process
 
 ALLOWED_VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".mkv", ".webm", ".avi"})
 COPY_CHUNK_BYTES = 1024 * 1024
@@ -16,6 +21,31 @@ class UploadValidationError(ValueError):
 
 class UploadTooLargeError(UploadValidationError):
     pass
+
+
+def probe_video_duration(path: Path) -> float:
+    try:
+        result = run_process(
+            [imageio_ffmpeg.get_ffmpeg_exe(), "-i", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise UploadValidationError(
+            "Не удалось проверить длительность загруженного видео"
+        ) from exc
+    match = re.search(
+        r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)",
+        str(result.stderr or ""),
+    )
+    if not match:
+        raise UploadValidationError("Не удалось определить длительность видео")
+    hours, minutes, seconds = match.groups()
+    duration = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    if duration <= 0:
+        raise UploadValidationError("Видео имеет некорректную длительность")
+    return duration
 
 
 def _looks_like_video(path: Path) -> bool:

@@ -3,6 +3,8 @@ const state = {
   filter: "all",
   selectedClipId: null,
   uploadFile: null,
+  pendingUpload: null,
+  editorDuration: 0,
   busy: false,
   csrfToken: null,
 };
@@ -87,7 +89,9 @@ function renderDashboard(data) {
   $("#youtubeCard .switch").classList.toggle("on", yt.enabled && yt.connected);
 
   const tg = data.platforms.telegram;
-  $("#telegramDetail").textContent = tg.connected ? "Бот и канал подключены" : "Добавьте токен бота и ID канала";
+  $("#telegramDetail").textContent = tg.running
+    ? "Бот запущен вместе с сервером"
+    : (tg.connected ? "Настройки найдены, бот не запущен" : "Добавьте токен бота и ID канала");
   $("#telegramSwitch").classList.toggle("on", tg.enabled && tg.connected);
 
   $("#scheduleEnabled").checked = yt.enabled;
@@ -105,6 +109,9 @@ function privacyLabel(value) {
 
 function renderJobs(jobs) {
   $("#jobCount").textContent = jobs.length;
+  $("#clearJobsButton").disabled = !jobs.some(job =>
+    ["succeeded", "failed", "attention", "cancelled"].includes(job.status)
+  );
   if (!jobs.length) {
     $("#jobsList").innerHTML = `<div class="empty-state compact"><span>◎</span><p>Новых задач пока нет</p></div>`;
     return;
@@ -150,6 +157,27 @@ $("#jobsList").addEventListener("click", async event => {
   }
 });
 
+$("#clearJobsButton").addEventListener("click", () => {
+  $("#clearJobsDialog").showModal();
+});
+
+$("#clearJobsForm").addEventListener("submit", async event => {
+  event.preventDefault();
+  const button = $("#clearJobsButton");
+  button.disabled = true;
+  try {
+    const result = await api("/api/jobs/history", {method: "DELETE"});
+    $("#clearJobsDialog").close();
+    toast(result.cleared
+      ? `Удалено завершённых процессов: ${result.cleared}`
+      : "Завершённых процессов для очистки нет");
+    await refresh();
+  } catch (error) {
+    toast(error.message, "error");
+    button.disabled = false;
+  }
+});
+
 function renderQueue(clips) {
   const filtered = clips.filter(clip => state.filter === "all" || clip.status === state.filter);
   if (!filtered.length) {
@@ -163,7 +191,13 @@ function renderQueue(clips) {
       <button data-action="edit" data-id="${clip.id}">Текст</button>
       <button class="publish" data-action="publish" data-id="${clip.id}">YouTube ↗</button>
       <button data-action="reject" data-id="${clip.id}">Отклонить</button>
-    ` : clip.file_exists ? `<button data-action="preview" data-id="${clip.id}">Просмотр</button>` : "";
+      <button class="delete" data-action="delete" data-id="${clip.id}">Удалить</button>
+    ` : clip.status === "publishing" ? `
+      ${clip.file_exists ? `<button data-action="preview" data-id="${clip.id}">Просмотр</button>` : ""}
+    ` : `
+      ${clip.file_exists ? `<button data-action="preview" data-id="${clip.id}">Просмотр</button>` : ""}
+      <button class="delete" data-action="delete" data-id="${clip.id}">Удалить</button>
+    `;
     return `
       <article class="queue-row" data-status="${escapeHtml(clip.status)}">
         <div class="video-info">
@@ -240,7 +274,42 @@ $$('input[name="sourceMode"]').forEach(input => input.addEventListener("change",
   $("#doramaForm button[type=submit]").firstChild.textContent = licensed ? "Найти и собрать выпуск " : "Создать обзор без скачивания ";
 }));
 
+function episodeMode() {
+  return $('input[name="episodeMode"]:checked')?.value || "recap";
+}
+
+function formatClock(value) {
+  const total = Math.max(0, Math.round(Number(value) || 0));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  return hours
+    ? `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
+    : `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function updateUploadMode() {
+  const translate = episodeMode() === "translate";
+  const focusField = $("#episodeFocus").closest("label");
+  focusField.hidden = translate;
+  $("#episodeFocus").disabled = translate;
+  $("#uploadButtonLabel").textContent = translate ? "Перевести выбранный фрагмент" : "Сделать пересказ на 5 минут";
+  $("#episodeFeatures").innerHTML = translate
+    ? `<li><span>01</span><div><b>Точная хронология</b><small>без перестановки и пересказа сцен</small></div></li>
+       <li><span>02</span><div><b>Фрагмент до 5 минут</b><small>для длинного видео откроется таймлайн</small></div></li>
+       <li><span>03</span><div><b>Русская озвучка</b><small>перевод речи, QA и субтитры</small></div></li>`
+    : `<li><span>01</span><div><b>Сюжетный таймлайн</b><small>распознаёт речь на любом языке</small></div></li>
+       <li><span>02</span><div><b>Ключевые сцены</b><small>монтаж ровно на пять минут</small></div></li>
+       <li><span>03</span><div><b>Русский сторителлинг</b><small>озвучка, QA и субтитры</small></div></li>`;
+}
+
 function setUploadFile(file) {
+  if (
+    state.pendingUpload
+    && (!file || state.pendingUpload.source_name !== file.name || state.pendingUpload.source_size !== file.size)
+  ) {
+    state.pendingUpload = null;
+  }
   state.uploadFile = file || null;
   $("#uploadTitle").textContent = file ? file.name : "Перетащите серию или трейлер";
   $("#uploadHint").textContent = file ? `${(file.size / 1024 / 1024).toFixed(1)} МБ · готово к анализу` : "ваш файл с правом использования · MP4, MOV, MKV, WEBM";
@@ -249,40 +318,181 @@ function setUploadFile(file) {
 
 $("#videoFile").addEventListener("change", event => setUploadFile(event.target.files[0]));
 $("#rightsConfirm").addEventListener("change", () => setUploadFile(state.uploadFile));
+$$('input[name="episodeMode"]').forEach(input => input.addEventListener("change", updateUploadMode));
 ["dragenter", "dragover"].forEach(name => $("#dropzone").addEventListener(name, event => { event.preventDefault(); $("#dropzone").classList.add("dragging"); }));
 ["dragleave", "drop"].forEach(name => $("#dropzone").addEventListener(name, event => { event.preventDefault(); $("#dropzone").classList.remove("dragging"); }));
 $("#dropzone").addEventListener("drop", event => setUploadFile(event.dataTransfer.files[0]));
+
+function clearUploadForm() {
+  state.pendingUpload = null;
+  setUploadFile(null);
+  $("#videoFile").value = "";
+  $("#rightsConfirm").checked = false;
+}
+
+async function submitEpisodeJob(uploaded, startSeconds = null, endSeconds = null) {
+  const mode = uploaded.mode;
+  const payload = {
+    filename: uploaded.filename,
+    focus: mode === "recap" ? uploaded.focus : "",
+    rights_confirmed: true,
+    mode,
+  };
+  if (mode === "translate") {
+    payload.start_seconds = startSeconds ?? 0;
+    payload.end_seconds = endSeconds ?? uploaded.duration_seconds;
+  }
+  await api("/api/jobs/episode", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+function updateEditorSelection(changed = "start") {
+  const duration = state.editorDuration;
+  let start = Number($("#editorStart").value);
+  let end = Number($("#editorEnd").value);
+  if (!Number.isFinite(start)) start = 0;
+  if (!Number.isFinite(end)) end = Math.min(300, duration);
+  start = Math.max(0, Math.min(start, Math.max(0, duration - 10)));
+  end = Math.max(10, Math.min(end, duration));
+  if (changed === "start") {
+    start = Math.min(start, end - 10);
+    if (end - start > 300) end = Math.min(duration, start + 300);
+  } else {
+    end = Math.max(end, start + 10);
+    if (end - start > 300) start = Math.max(0, end - 300);
+  }
+  start = Math.max(0, start);
+  end = Math.min(duration, end);
+
+  $("#editorStart").value = start.toFixed(1);
+  $("#editorEnd").value = end.toFixed(1);
+  $("#editorStartRange").value = String(start);
+  $("#editorEndRange").value = String(end);
+  const left = duration ? (start / duration) * 100 : 0;
+  const width = duration ? ((end - start) / duration) * 100 : 0;
+  $("#editorSelection").style.left = `${left}%`;
+  $("#editorSelection").style.width = `${width}%`;
+  $("#editorSelectedDuration").textContent = formatClock(end - start);
+  $("#startTranslationButton").disabled = end - start < 10 || end - start > 300.01;
+}
+
+function openTranslationEditor(uploaded) {
+  state.pendingUpload = uploaded;
+  state.editorDuration = Number(uploaded.duration_seconds);
+  const end = Math.min(300, state.editorDuration);
+  $("#editorFilename").textContent = `${uploaded.display_name || uploaded.filename} · ${formatClock(state.editorDuration)}. Выберите непрерывный фрагмент до пяти минут.`;
+  $("#editorDurationLabel").textContent = formatClock(state.editorDuration);
+  ["#editorStartRange", "#editorEndRange"].forEach(selector => {
+    $(selector).max = String(state.editorDuration);
+  });
+  $("#editorStart").max = String(Math.max(0, state.editorDuration - 10));
+  $("#editorEnd").max = String(state.editorDuration);
+  $("#editorStart").value = "0.0";
+  $("#editorEnd").value = end.toFixed(1);
+  $("#editorVideo").src = `/api/uploads/${encodeURIComponent(uploaded.filename)}/video`;
+  $("#editorPlayhead").textContent = "00:00";
+  updateEditorSelection("start");
+  $("#translationEditorDialog").showModal();
+}
 
 $("#uploadForm").addEventListener("submit", async event => {
   event.preventDefault();
   if (!state.uploadFile) return;
   const button = $("#clipButton");
   button.disabled = true;
-  button.firstChild.textContent = "Загружаю файл ";
+  $("#uploadButtonLabel").textContent = "Загружаю и проверяю файл";
   try {
+    if (
+      episodeMode() === "translate"
+      && state.pendingUpload?.editor_required
+      && state.pendingUpload.source_name === state.uploadFile.name
+      && state.pendingUpload.source_size === state.uploadFile.size
+    ) {
+      openTranslationEditor(state.pendingUpload);
+      return;
+    }
     const form = new FormData();
     form.append("file", state.uploadFile);
     const uploaded = await api("/api/uploads", { method: "POST", body: form });
-    await api("/api/jobs/episode", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        filename: uploaded.filename,
-        focus: $("#episodeFocus").value.trim(),
-        rights_confirmed: $("#rightsConfirm").checked,
-      }),
-    });
-    toast("Файл загружен. Пятиминутный пересказ запущен.");
-    setUploadFile(null);
-    $("#videoFile").value = "";
-    $("#rightsConfirm").checked = false;
+    const prepared = {
+      ...uploaded,
+      mode: episodeMode(),
+      focus: $("#episodeFocus").value.trim(),
+      source_name: state.uploadFile.name,
+      source_size: state.uploadFile.size,
+    };
+    if (prepared.mode === "translate" && prepared.editor_required) {
+      openTranslationEditor(prepared);
+      toast("Видео длиннее пяти минут — выберите фрагмент на таймлайне.");
+      return;
+    }
+    await submitEpisodeJob(prepared);
+    toast(prepared.mode === "translate"
+      ? "Файл загружен. Прямой перевод всего фрагмента запущен."
+      : "Файл загружен. Пятиминутный пересказ запущен.");
+    clearUploadForm();
     await refresh();
   } catch (error) {
     toast(error.message, "error");
   } finally {
     button.disabled = !state.uploadFile || !$("#rightsConfirm").checked;
-    button.firstChild.textContent = "Сделать пересказ на 5 минут ";
+    updateUploadMode();
   }
+});
+
+$("#editorStartRange").addEventListener("input", event => {
+  $("#editorStart").value = event.target.value;
+  updateEditorSelection("start");
+  $("#editorVideo").currentTime = Number($("#editorStart").value);
+});
+$("#editorEndRange").addEventListener("input", event => {
+  $("#editorEnd").value = event.target.value;
+  updateEditorSelection("end");
+  $("#editorVideo").currentTime = Number($("#editorEnd").value);
+});
+$("#editorStart").addEventListener("change", () => updateEditorSelection("start"));
+$("#editorEnd").addEventListener("change", () => updateEditorSelection("end"));
+$("#setEditorStart").addEventListener("click", () => {
+  $("#editorStart").value = String($("#editorVideo").currentTime);
+  updateEditorSelection("start");
+});
+$("#setEditorEnd").addEventListener("click", () => {
+  $("#editorEnd").value = String($("#editorVideo").currentTime);
+  updateEditorSelection("end");
+});
+$("#editorVideo").addEventListener("timeupdate", event => {
+  $("#editorPlayhead").textContent = formatClock(event.target.currentTime);
+});
+$("#translationEditorForm").addEventListener("submit", async event => {
+  event.preventDefault();
+  if (!state.pendingUpload) return;
+  const button = $("#startTranslationButton");
+  button.disabled = true;
+  button.textContent = "Добавляю в очередь…";
+  try {
+    await submitEpisodeJob(
+      state.pendingUpload,
+      Number($("#editorStart").value),
+      Number($("#editorEnd").value),
+    );
+    $("#translationEditorDialog").close();
+    clearUploadForm();
+    toast("Прямой перевод выбранного фрагмента запущен.");
+    await refresh();
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    button.textContent = "Перевести фрагмент";
+    button.disabled = false;
+  }
+});
+$("#translationEditorDialog").addEventListener("close", () => {
+  $("#editorVideo").pause();
+  $("#editorVideo").removeAttribute("src");
+  $("#editorVideo").load();
 });
 
 $("#queueList").addEventListener("click", async event => {
@@ -318,6 +528,19 @@ $("#queueList").addEventListener("click", async event => {
       toast("Выпуск отклонён и убран из очереди");
       await refresh();
     } catch (error) { toast(error.message, "error"); }
+  }
+  if (action === "delete" && window.confirm(`Удалить выпуск «${titleFromCaption(clip.caption)}» и его локальные файлы без возможности восстановления?`)) {
+    button.disabled = true;
+    try {
+      const result = await api(`/api/clips/${id}`, { method: "DELETE" });
+      toast(result.cleanup_pending
+        ? "Выпуск удалён; временная копия осталась в скрытой папке .trash"
+        : "Выпуск и локальные файлы удалены");
+      await refresh();
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message, "error");
+    }
   }
 });
 
@@ -434,5 +657,6 @@ $("#runSchedulerButton").addEventListener("click", async () => {
 });
 $("#refreshButton").addEventListener("click", () => refresh());
 
+updateUploadMode();
 refresh();
 setInterval(() => refresh({ silent: true }), 5000);

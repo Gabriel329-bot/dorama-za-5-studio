@@ -7,8 +7,16 @@ from pathlib import Path
 import imageio_ffmpeg  # type: ignore[import-untyped]
 from PIL import Image, ImageDraw, ImageFont
 
-from clipper.render import _ass_escape_path, _fmt_ass_time
+from clipper.render import _ass_escape_path
+from clipper.transcribe import release_models, transcribe
 from job_control import run_process
+from media_pipeline.audio import (
+    audio_duration,
+    prepare_final_voice,
+    validate_final_media,
+)
+from media_pipeline.resources import render_slot
+from media_pipeline.subtitles import build_cues, write_ass
 from video_accel import selected_encoder_options
 
 
@@ -57,42 +65,28 @@ def _sentences(text: str) -> list[str]:
     return [part.strip() for part in re.split(r"(?<=[.!?…])\s+", text) if part.strip()]
 
 
-def create_subtitles(text: str, duration: float, output_path: Path) -> Path:
-    parts = _sentences(text) or [text]
-    weights = [max(len(part), 1) for part in parts]
-    total = sum(weights)
-    cursor = 0.0
-    header = """[Script Info]
-ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
-WrapStyle: 0
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,58,&H00FFFFFF,&H00FFFFFF,&H00140A14,&H90000000,-1,0,0,0,100,100,0,0,1,4,1,2,70,70,170,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
-    lines = [header]
-    for index, part in enumerate(parts):
-        end = duration if index == len(parts) - 1 else cursor + duration * weights[index] / total
-        safe = part.replace("{", "(").replace("}", ")").replace("\n", " ")
-        lines.append(f"Dialogue: 0,{_fmt_ass_time(cursor)},{_fmt_ass_time(end)},Default,,0,0,0,,{safe}")
-        cursor = end
-    output_path.write_text("\n".join(lines), encoding="utf-8")
-    return output_path
+def create_subtitles(
+    voice_path: Path,
+    duration: float,
+    output_path: Path,
+    *,
+    scene_cuts: list[float] | None = None,
+) -> Path:
+    """Строить субтитры только по фактическим word timestamps готовой озвучки."""
+    try:
+        transcript = transcribe(str(voice_path), language="ru")
+        cues = build_cues(
+            transcript.words,
+            duration,
+            scene_cuts=scene_cuts or (),
+        )
+        return write_ass(cues, output_path)
+    finally:
+        release_models()
 
 
 def _audio_duration(audio_path: Path) -> float:
-    exe = imageio_ffmpeg.get_ffmpeg_exe()
-    result = run_process([exe, "-i", str(audio_path)], capture_output=True, text=True)
-    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
-    if not match:
-        raise RuntimeError("Не удалось определить длительность озвучки")
-    hours, minutes, seconds = match.groups()
-    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    return audio_duration(audio_path)
 
 
 def _fit_audio(audio_path: Path, target_duration: float, output_path: Path) -> Path:
@@ -105,7 +99,21 @@ def _fit_audio(audio_path: Path, target_duration: float, output_path: Path) -> P
             f"Измените целевое число слов, чтобы коэффициент был от 0.80 до 1.25."
         )
     result = run_process(
-        [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", str(audio_path), "-filter:a", f"atempo={factor:.6f}", str(output_path)],
+        [
+            imageio_ffmpeg.get_ffmpeg_exe(),
+            "-y",
+            "-i",
+            str(audio_path),
+            "-filter:a",
+            f"atempo={factor:.6f},aresample=48000:async=1:first_pts=0",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-c:a",
+            "pcm_s24le" if output_path.suffix.lower() == ".wav" else "aac",
+            str(output_path),
+        ],
         capture_output=True,
         text=True,
     )
@@ -123,7 +131,7 @@ def render_video(
 ) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ass_path = output_path.with_suffix(".ass")
-    fitted_audio = output_path.with_suffix(".fitted.m4a")
+    fitted_audio = output_path.with_suffix(".fitted.wav")
     if target_duration:
         _fit_audio(audio_path, target_duration, fitted_audio)
         render_audio = fitted_audio
@@ -131,24 +139,37 @@ def render_video(
     else:
         render_audio = audio_path
         duration = _audio_duration(audio_path)
-    create_subtitles(narration, duration, ass_path)
+    normalized_audio = prepare_final_voice(
+        render_audio,
+        render_audio.parent,
+        duration=duration,
+    )
+    create_subtitles(normalized_audio, duration, ass_path)
     encoder, encoder_args = selected_encoder_options(still_image=True)
     print(f"  FFmpeg encoder: {encoder}")
     command = [
-        imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loop", "1", "-i", str(cover_path),
-        "-i", str(render_audio), "-vf", f"subtitles='{_ass_escape_path(ass_path)}'",
+        imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loop", "1", "-framerate", "30", "-i", str(cover_path),
+        "-i", str(normalized_audio), "-vf", f"subtitles='{_ass_escape_path(ass_path)}'",
         *encoder_args,
-        "-c:a", "aac", "-b:a", "160k", "-pix_fmt", "yuv420p", "-shortest", str(output_path),
+        "-c:a", "aac", "-b:a", "160k", "-pix_fmt", "yuv420p",
+        "-r", "30", "-t", f"{duration:.6f}", "-shortest", str(output_path),
     ]
     try:
-        result = run_process(command, capture_output=True, text=True)
+        with render_slot(encoder):
+            result = run_process(command, capture_output=True, text=True)
     except BaseException:
         output_path.unlink(missing_ok=True)
         raise
     finally:
         ass_path.unlink(missing_ok=True)
         fitted_audio.unlink(missing_ok=True)
+        normalized_audio.unlink(missing_ok=True)
     if result.returncode != 0:
         output_path.unlink(missing_ok=True)
         raise RuntimeError(f"ffmpeg не смог собрать дорама-ролик:\n{result.stderr[-2500:]}")
+    try:
+        validate_final_media(output_path, target_duration=duration)
+    except BaseException:
+        output_path.unlink(missing_ok=True)
+        raise
     return output_path

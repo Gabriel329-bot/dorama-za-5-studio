@@ -1,8 +1,10 @@
 """Русская озвучка: локальная Chatterbox V3 с безопасным откатом на Edge TTS."""
 import asyncio
+import gc
 import json
 import re
 import shutil
+import sys
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -11,6 +13,7 @@ import edge_tts
 import imageio_ffmpeg  # type: ignore[import-untyped]
 
 from job_control import checkpoint, run_process
+from media_pipeline.resources import accelerator_slot
 from settings import CONFIG, ROOT_DIR
 
 _qa_model = None
@@ -84,8 +87,19 @@ async def synthesize(text: str, output_path: Path, voice: str, rate: str = "+0%"
     if not output_path.is_file() or output_path.stat().st_size == 0:
         raise RuntimeError("Сервис озвучки не создал аудиофайл")
     if cfg.get("tts_qa_enabled", True):
-        provider = await _quality_gate(normalized, output_path, voice, rate, pitch, provider, cfg)
-        print(f"  TTS QA: выбран {provider}")
+        try:
+            provider = await _quality_gate(
+                normalized,
+                output_path,
+                voice,
+                rate,
+                pitch,
+                provider,
+                cfg,
+            )
+            print(f"  TTS QA: выбран {provider}")
+        finally:
+            release_qa_model()
     return output_path
 
 
@@ -171,6 +185,12 @@ async def _synthesize_edge_chunked(
 def _synthesize_chatterbox(text: str, output_path: Path, cfg: dict[str, Any]) -> None:
     python_exe = ROOT_DIR / "tts-venv" / "Scripts" / "python.exe"
     worker = ROOT_DIR / "dorama" / "chatterbox_worker.py"
+    if not worker.is_file() and getattr(sys, "frozen", False):
+        worker = (
+            Path(str(vars(sys)["_MEIPASS"]))
+            / "dorama"
+            / "chatterbox_worker.py"
+        )
     if not python_exe.is_file():
         raise RuntimeError("не найдено отдельное окружение tts-venv")
     job_path = output_path.with_suffix(".tts-job.json")
@@ -183,12 +203,35 @@ def _synthesize_chatterbox(text: str, output_path: Path, cfg: dict[str, Any]) ->
         "temperature": cfg.get("chatterbox_temperature", 0.55),
     }
     job_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
-    result = run_process(
-        [str(python_exe), str(worker), "--job", str(job_path), "--output", str(output_path)],
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
+    if str(cfg.get("chatterbox_device", "cuda")) == "cuda":
+        with accelerator_slot("chatterbox"):
+            result = run_process(
+                [
+                    str(python_exe),
+                    str(worker),
+                    "--job",
+                    str(job_path),
+                    "--output",
+                    str(output_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=1800,
+            )
+    else:
+        result = run_process(
+            [
+                str(python_exe),
+                str(worker),
+                "--job",
+                str(job_path),
+                "--output",
+                str(output_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
     job_path.unlink(missing_ok=True)
     if result.returncode != 0:
         raise RuntimeError(result.stderr[-2500:] or result.stdout[-2500:])
@@ -218,6 +261,13 @@ def _transcribe_for_qa(audio_path: Path) -> str:
         checkpoint()
         text_parts.append(segment.text.strip())
     return " ".join(text_parts).strip()
+
+
+def release_qa_model() -> None:
+    """Не удерживать CPU-модель QA между независимыми задачами."""
+    global _qa_model
+    _qa_model = None
+    gc.collect()
 
 
 async def _quality_gate(

@@ -1,30 +1,41 @@
 from __future__ import annotations
 
 import io
+import os
+import sys
 import tempfile
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import patch
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from background_services import SchedulerService
 from dorama.licensed_sources import _validate_download_url
+from dorama.literal_translation import validate_translation_interval
 from job_control import cancellable_wait
+from runtime_support import python_module_command, resolve_app_home
 from storage import db
 from telegram_bot import api_client
-from webapp.app import app
+from webapp.app import app, create_episode, job_manager
 from webapp.health import HealthService
+from webapp.job_handlers import execute_persistent_job
 from webapp.job_store import JobStore
 from webapp.jobs import JobManager
-from webapp.schemas import DoramaRequest
-from webapp.uploads import UploadTooLargeError, save_video_upload
+from webapp.schemas import DoramaRequest, EpisodeRequest
+from webapp.uploads import UploadTooLargeError, probe_video_duration, save_video_upload
 
 
 class ApiSecurityTests(unittest.TestCase):
+    client: ClassVar[TestClient]
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.client = TestClient(app)
@@ -40,15 +51,162 @@ class ApiSecurityTests(unittest.TestCase):
         )
         self.assertEqual(404, allowed.status_code)
 
+    def test_clear_history_endpoint_keeps_api_protected(self) -> None:
+        denied = self.client.delete("/api/jobs/history")
+        self.assertEqual(403, denied.status_code)
+        token = self.client.get("/api/session").json()["csrf_token"]
+        with patch.object(
+            job_manager,
+            "clear_terminal_history",
+            return_value=3,
+        ) as clear:
+            response = self.client.delete(
+                "/api/jobs/history",
+                headers={"X-Dorama-CSRF": token},
+            )
+        self.assertEqual(200, response.status_code)
+        self.assertEqual({"cleared": 3}, response.json())
+        clear.assert_called_once_with()
+
+    def test_queue_clip_delete_removes_record_and_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "queue.db"
+            pending = root / "output" / "pending"
+            posted = root / "output" / "posted"
+            rejected = root / "output" / "rejected"
+            pending.mkdir(parents=True)
+            video = pending / "episode.mp4"
+            subtitle = video.with_suffix(".ass")
+            video.write_bytes(b"video")
+            subtitle.write_text("subtitles", encoding="utf-8")
+            with (
+                patch("storage.db.DB_PATH", database),
+                patch("webapp.app.PENDING_DIR", pending),
+                patch("webapp.app.POSTED_DIR", posted),
+                patch("webapp.app.REJECTED_DIR", rejected),
+            ):
+                db.init_db()
+                clip_id = db.add_pending(str(video), "caption", "source")
+                token = self.client.get("/api/session").json()["csrf_token"]
+                response = self.client.delete(
+                    f"/api/clips/{clip_id}",
+                    headers={"X-Dorama-CSRF": token},
+                )
+                row = db.get_clip(clip_id)
+
+            self.assertEqual(200, response.status_code)
+            self.assertEqual(2, response.json()["deleted_files"])
+            self.assertFalse(response.json()["cleanup_pending"])
+            self.assertIsNone(row)
+            self.assertFalse(video.exists())
+            self.assertFalse(subtitle.exists())
+
+    def test_queue_clip_delete_rejects_file_outside_media_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "queue.db"
+            pending = root / "output" / "pending"
+            posted = root / "output" / "posted"
+            rejected = root / "output" / "rejected"
+            outside = root / "do-not-delete.mp4"
+            outside.write_bytes(b"private")
+            with (
+                patch("storage.db.DB_PATH", database),
+                patch("webapp.app.PENDING_DIR", pending),
+                patch("webapp.app.POSTED_DIR", posted),
+                patch("webapp.app.REJECTED_DIR", rejected),
+            ):
+                db.init_db()
+                clip_id = db.add_pending(str(outside), "caption", "source")
+                token = self.client.get("/api/session").json()["csrf_token"]
+                response = self.client.delete(
+                    f"/api/clips/{clip_id}",
+                    headers={"X-Dorama-CSRF": token},
+                )
+                row = db.get_clip(clip_id)
+
+            self.assertEqual(409, response.status_code)
+            self.assertTrue(outside.is_file())
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual("pending", row["status"])
+
     def test_untrusted_host_is_rejected(self) -> None:
         response = self.client.get("/api/session", headers={"host": "attacker.invalid"})
         self.assertEqual(400, response.status_code)
 
     def test_request_models_are_strict_and_forbid_extra_fields(self) -> None:
         with self.assertRaises(ValidationError):
-            DoramaRequest(query="дорамы", limit="10")
+            DoramaRequest(query="дорамы", limit="10")  # type: ignore[arg-type]
         with self.assertRaises(ValidationError):
-            DoramaRequest(query="дорамы", limit=10, unexpected=True)
+            DoramaRequest(query="дорамы", limit=10, unexpected=True)  # type: ignore[call-arg]
+
+    def test_literal_translation_interval_is_limited_to_five_minutes(self) -> None:
+        payload = EpisodeRequest(
+            filename="episode.mp4",
+            rights_confirmed=True,
+            mode="translate",
+            start_seconds=12.5,
+            end_seconds=312.5,
+        )
+        self.assertEqual("translate", payload.mode)
+        with self.assertRaises(ValidationError):
+            EpisodeRequest(
+                filename="episode.mp4",
+                rights_confirmed=True,
+                mode="translate",
+                start_seconds=0.0,
+                end_seconds=301.0,
+            )
+
+    def test_literal_translation_interval_checks_media_bounds(self) -> None:
+        self.assertEqual((20.0, 320.0), validate_translation_interval(20, 320, 900))
+        with self.assertRaisesRegex(ValueError, "длительность видео"):
+            validate_translation_interval(20, 321, 300)
+
+    def test_episode_endpoint_submits_selected_literal_translation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            input_dir = Path(temporary)
+            source = input_dir / "episode.mp4"
+            source.write_bytes(b"video")
+            payload = EpisodeRequest(
+                filename=source.name,
+                rights_confirmed=True,
+                mode="translate",
+                start_seconds=120.0,
+                end_seconds=320.0,
+            )
+            marker = object()
+            with (
+                patch("webapp.app.INPUT_DIR", input_dir),
+                patch("webapp.app.probe_video_duration", return_value=1000.0),
+                patch("webapp.app._submit_persistent_job", return_value=marker) as submit,
+            ):
+                result = create_episode(payload)
+        self.assertIs(marker, result)
+        self.assertEqual("literal-translation", submit.call_args.args[0])
+        self.assertEqual(120.0, submit.call_args.args[2]["start_seconds"])
+        self.assertEqual(320.0, submit.call_args.args[2]["end_seconds"])
+
+    def test_long_translation_requires_editor_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            input_dir = Path(temporary)
+            source = input_dir / "episode.mp4"
+            source.write_bytes(b"video")
+            payload = EpisodeRequest(
+                filename=source.name,
+                rights_confirmed=True,
+                mode="translate",
+            )
+            with (
+                patch("webapp.app.INPUT_DIR", input_dir),
+                patch("webapp.app.probe_video_duration", return_value=301.0),
+                self.assertRaises(HTTPException) as context,
+            ):
+                create_episode(payload)
+        self.assertEqual(422, context.exception.status_code)
+        self.assertIn("редакторе", str(context.exception.detail))
 
     def test_download_allowlist_rejects_ssrf_url(self) -> None:
         with self.assertRaises(RuntimeError):
@@ -130,8 +288,31 @@ class AtomicQueueTests(unittest.TestCase):
             assert row is not None
             self.assertEqual("first.mp4", row["file_path"])
 
+    def test_deletion_claim_blocks_publish_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "queue.db"
+            with patch("storage.db.DB_PATH", database):
+                db.init_db()
+                clip_id = db.add_pending("video.mp4", "caption", "source")
+                deletion_claim = db.claim_for_deletion(clip_id)
+                publish_claim = db.claim_pending("youtube", clip_id)
+                self.assertIsNotNone(deletion_claim)
+                self.assertIsNone(publish_claim)
+                assert deletion_claim is not None
+                row, previous_status = deletion_claim
+                self.assertEqual("pending", previous_status)
+                db.delete_claimed(clip_id, str(row["claim_token"]))
+                self.assertIsNone(db.get_clip(clip_id))
+
 
 class ResourceBoundTests(unittest.TestCase):
+    @patch("webapp.uploads.run_process")
+    def test_upload_duration_probe_reads_ffmpeg_metadata(self, run_process) -> None:
+        run_process.return_value = SimpleNamespace(
+            stderr="Duration: 00:42:03.75, start: 0.000000, bitrate: 1000 kb/s"
+        )
+        self.assertEqual(2523.75, probe_video_duration(Path("episode.mp4")))
+
     def test_upload_is_streamed_limited_and_partial_file_is_deleted(self) -> None:
         payload = b"\x00\x00\x00\x18ftypisom" + b"x" * 64
         with tempfile.TemporaryDirectory() as temporary:
@@ -154,6 +335,36 @@ class ResourceBoundTests(unittest.TestCase):
         manager.executor.shutdown(wait=True)
         self.assertLessEqual(len(manager.jobs), 10)
 
+    def test_clear_history_preserves_active_job(self) -> None:
+        manager = JobManager(max_workers=1)
+        finished = manager.submit("test", "Готовая", lambda: "ok")
+        for _ in range(80):
+            if manager.recent(1)[0]["status"] == "succeeded":
+                break
+            time.sleep(0.025)
+
+        started = Event()
+
+        def keep_running() -> None:
+            started.set()
+            while True:
+                cancellable_wait(0.02)
+
+        active = manager.submit("test", "Активная", keep_running)
+        self.assertTrue(started.wait(2))
+
+        self.assertEqual(1, manager.clear_terminal_history())
+        self.assertNotIn(finished["id"], manager.jobs)
+        self.assertIn(active["id"], manager.jobs)
+
+        manager.cancel(active["id"])
+        for _ in range(80):
+            if active["id"] not in manager.jobs:
+                break
+            time.sleep(0.025)
+        self.assertNotIn(active["id"], manager.jobs)
+        manager.shutdown()
+
     def test_health_probes_are_cached(self) -> None:
         service = HealthService(ttl_seconds=60)
         with (
@@ -164,8 +375,126 @@ class ResourceBoundTests(unittest.TestCase):
         ollama.assert_called_once()
         scheduler.assert_called_once()
 
+    def test_embedded_scheduler_runs_and_stops(self) -> None:
+        called = Event()
+        service = SchedulerService(
+            checker=called.set,
+            interval_seconds=0.05,
+            initial_delay_seconds=0.0,
+        )
+        config = {
+            "publishing": {
+                "youtube": {"enabled": True},
+                "telegram": {"enabled": False},
+            },
+            "dorama": {"require_review": False},
+        }
+        with patch("background_services.CONFIG", config):
+            self.assertTrue(service.start())
+            self.assertTrue(called.wait(1))
+            self.assertTrue(service.running)
+            service.stop()
+        self.assertFalse(service.running)
+
+    def test_embedded_scheduler_respects_manual_review(self) -> None:
+        checked = Event()
+        service = SchedulerService(
+            checker=checked.set,
+            interval_seconds=0.05,
+            initial_delay_seconds=0.0,
+        )
+        config = {
+            "publishing": {
+                "youtube": {"enabled": True},
+                "telegram": {"enabled": True},
+            },
+            "dorama": {"require_review": True},
+        }
+        with patch("background_services.CONFIG", config):
+            service.start()
+            time.sleep(0.12)
+            service.stop()
+        self.assertFalse(checked.is_set())
+
+    def test_frozen_runtime_reenters_bundled_module(self) -> None:
+        with (
+            patch.object(sys, "frozen", True, create=True),
+            patch.object(sys, "executable", "Dorama Studio Server.exe"),
+        ):
+            command = python_module_command("yt_dlp", "--version")
+        self.assertEqual(
+            [
+                "Dorama Studio Server.exe",
+                "--internal-module",
+                "yt_dlp",
+                "--version",
+            ],
+            command,
+        )
+
+    def test_runtime_home_can_be_external_to_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "config.yaml").write_text("paths: {}", encoding="utf-8")
+            with patch.dict(os.environ, {"DORAMA_HOME": str(root)}):
+                self.assertEqual(root.resolve(), resolve_app_home())
+
 
 class RestartRecoveryTests(unittest.TestCase):
+    @patch("dorama.literal_translation.create_literal_translation")
+    @patch("webapp.job_handlers._input_file")
+    @patch("webapp.job_handlers._completed_output", return_value=None)
+    def test_literal_translation_job_is_restartable(
+        self,
+        _completed_output,
+        input_file,
+        create_translation,
+    ) -> None:
+        source = Path("episode.mp4")
+        result = Path("translated.mp4")
+        input_file.return_value = source
+        create_translation.return_value = result
+
+        actual = execute_persistent_job(
+            "job-translation",
+            "literal-translation",
+            {
+                "filename": source.name,
+                "start_seconds": 30.0,
+                "end_seconds": 210.0,
+            },
+        )
+
+        self.assertEqual(result, actual)
+        create_translation.assert_called_once_with(
+            source,
+            start_seconds=30.0,
+            end_seconds=210.0,
+            operation_id="job-translation",
+        )
+
+    def test_cancelled_history_is_purged_and_errors_wait_for_manual_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = JobStore(Path(temporary) / "jobs.db")
+            store.initialize()
+            cancelled = self._stored_record(status="cancelled")
+            failed = self._stored_record(status="failed")
+            cancelled["id"] = "cancelled-job"
+            failed["id"] = "failed-job"
+            store.save(cancelled, {}, resumable=True)
+            store.save(failed, {}, resumable=True)
+
+            manager = JobManager(
+                store=store,
+                persistent_handler=lambda *_args: None,
+            )
+            manager.start()
+            self.assertEqual(["failed-job"], [job["id"] for job in manager.recent(10)])
+            self.assertEqual(1, manager.clear_terminal_history())
+            self.assertEqual([], manager.recent(10))
+            self.assertEqual([], store.load_recent(10))
+            manager.shutdown()
+
     @staticmethod
     def _stored_record(status: str = "running") -> dict[str, object]:
         return {

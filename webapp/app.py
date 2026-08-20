@@ -4,6 +4,7 @@ from __future__ import annotations
 import mimetypes
 import re
 import sqlite3
+import sys
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -16,10 +17,14 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from background_services import scheduler_service
 from config_store import apply_config_snapshot, update_config_file
 from settings import (
     CONFIG,
     INPUT_DIR,
+    PENDING_DIR,
+    POSTED_DIR,
+    REJECTED_DIR,
     ROOT_DIR,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHANNEL_ID,
@@ -28,7 +33,7 @@ from settings import (
     YOUTUBE_TOKEN_PATH,
 )
 from storage import db
-from storage.files import move_to_unique
+from storage.files import move_to_unique, stage_clip_artifacts_for_deletion
 from webapp.health import HealthService
 from webapp.job_handlers import execute_persistent_job
 from webapp.job_store import JobStore
@@ -44,10 +49,20 @@ from webapp.schemas import (
     ScheduleRequest,
 )
 from webapp.security import RequestBodyLimitMiddleware, local_api_guard, session_payload
-from webapp.uploads import UploadTooLargeError, UploadValidationError, save_video_upload
+from webapp.uploads import (
+    UploadTooLargeError,
+    UploadValidationError,
+    probe_video_duration,
+    save_video_upload,
+)
 
-STATIC_DIR = Path(__file__).resolve().parent / "static"
+BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", ROOT_DIR))
+STATIC_DIR = BUNDLE_DIR / "webapp" / "static"
+if not STATIC_DIR.is_dir():
+    STATIC_DIR = Path(__file__).resolve().parent / "static"
 BRAND_DIR = ROOT_DIR / "assets" / "branding"
+if not BRAND_DIR.is_dir():
+    BRAND_DIR = BUNDLE_DIR / "assets" / "branding"
 CONFIG_PATH = ROOT_DIR / "config.yaml"
 DEFAULT_MAX_UPLOAD_MB = 2048
 ApiResponse: TypeAlias = dict[str, Any]
@@ -66,6 +81,7 @@ health_service = HealthService(ttl_seconds=15.0)
 @asynccontextmanager
 async def lifespan(_application: FastAPI) -> AsyncIterator[None]:
     db.init_db()
+    scheduler_service.start()
     bot_token = TELEGRAM_BOT_TOKEN
     user_id = TELEGRAM_USER_ID
     stop_bot = None
@@ -80,6 +96,7 @@ async def lifespan(_application: FastAPI) -> AsyncIterator[None]:
     finally:
         if stop_bot is not None:
             stop_bot()
+        scheduler_service.stop()
         job_manager.shutdown()
 
 
@@ -137,6 +154,11 @@ def cancel_job(job_id: str) -> ApiResponse:
         raise HTTPException(409, str(exc)) from exc
 
 
+@app.delete("/api/jobs/history")
+def clear_job_history() -> ApiResponse:
+    return {"cleared": job_manager.clear_terminal_history()}
+
+
 def _serialize_clip(row: sqlite3.Row) -> ApiResponse:
     file_path = Path(row["file_path"])
     return {
@@ -167,6 +189,14 @@ def _next_slot(post_times: list[str]) -> str | None:
     return min(candidates).astimezone().isoformat(timespec="minutes")
 
 
+def _telegram_bot_running() -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_USER_ID:
+        return False
+    from telegram_bot.bot import bot_is_running
+
+    return bot_is_running()
+
+
 def _update_youtube_config(payload: ScheduleRequest) -> None:
     times = [value.strip() for value in payload.post_times]
     if any(not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value) for value in times):
@@ -192,6 +222,7 @@ def dashboard() -> ApiResponse:
     counts = db.counts_by_status()
     yt = CONFIG["publishing"]["youtube"]
     recent_jobs = job_manager.recent(limit=10)
+    bot_running = _telegram_bot_running()
     health = health_service.snapshot(
         str(CONFIG["highlight"]["ollama_host"]), str(CONFIG["highlight"]["model"])
     )
@@ -224,11 +255,13 @@ def dashboard() -> ApiResponse:
             "telegram": {
                 "connected": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL_ID),
                 "enabled": bool(CONFIG["publishing"]["telegram"].get("enabled")),
+                "running": bot_running,
             },
             "tiktok": {"connected": False, "enabled": False, "reason": "Нужен доступ к Content Posting API"},
         },
         "system": {
             **health,
+            "telegram_bot": bot_running,
             "local_only": True,
         },
         "clips": [_serialize_clip(row) for row in db.recent(limit=40)],
@@ -280,7 +313,27 @@ def upload_video(file: Annotated[UploadFile, File(...)]) -> ApiResponse:
         raise HTTPException(413, str(exc)) from exc
     except UploadValidationError as exc:
         raise HTTPException(415, str(exc)) from exc
-    return {"filename": destination.name, "size_mb": round(size / 1024 / 1024, 1)}
+    try:
+        duration = probe_video_duration(destination)
+    except UploadValidationError as exc:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(415, str(exc)) from exc
+    return {
+        "filename": destination.name,
+        "display_name": Path(file.filename or destination.name).name[:255],
+        "size_mb": round(size / 1024 / 1024, 1),
+        "duration_seconds": round(duration, 3),
+        "editor_required": duration > 300.0,
+    }
+
+
+@app.get("/api/uploads/{filename}/video")
+def uploaded_video(filename: str) -> FileResponse:
+    source = (INPUT_DIR / Path(filename).name).resolve()
+    if source.parent != INPUT_DIR.resolve() or not source.is_file():
+        raise HTTPException(404, "Загруженный файл не найден")
+    media_type, _ = mimetypes.guess_type(source.name)
+    return FileResponse(source, media_type=media_type or "video/mp4")
 
 
 @app.post("/api/jobs/clip", status_code=202)
@@ -302,6 +355,38 @@ def create_episode(payload: EpisodeRequest) -> JobRecord:
     source = (INPUT_DIR / Path(payload.filename).name).resolve()
     if source.parent != INPUT_DIR.resolve() or not source.is_file():
         raise HTTPException(404, "Загруженный файл не найден")
+    if payload.mode == "translate":
+        from dorama.literal_translation import validate_translation_interval
+
+        try:
+            duration = probe_video_duration(source)
+            if payload.end_seconds is None:
+                if duration > 300.0:
+                    raise ValueError(
+                        "Для видео длиннее 5 минут выберите фрагмент в редакторе"
+                    )
+                end_seconds = duration
+            else:
+                end_seconds = payload.end_seconds
+            start_seconds, end_seconds = validate_translation_interval(
+                payload.start_seconds,
+                end_seconds,
+                duration,
+            )
+        except (UploadValidationError, ValueError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return _submit_persistent_job(
+            "literal-translation",
+            (
+                f"Перевод: {source.name} · "
+                f"{start_seconds:.1f}–{end_seconds:.1f} сек"
+            ),
+            {
+                "filename": source.name,
+                "start_seconds": start_seconds,
+                "end_seconds": end_seconds,
+            },
+        )
     return _submit_persistent_job(
         "episode",
         f"Пересказ: {source.name}",
@@ -327,8 +412,6 @@ def publish_youtube(clip_id: int, payload: PublishRequest) -> JobRecord:
 
 @app.post("/api/clips/{clip_id}/reject")
 def reject_clip(clip_id: int) -> ApiResponse:
-    from settings import REJECTED_DIR
-
     clip = db.claim_pending("reject", clip_id=clip_id)
     if clip is None:
         raise HTTPException(409, "В очереди нет такого ролика")
@@ -349,6 +432,50 @@ def reject_clip(clip_id: int) -> ApiResponse:
             db.release_claim(clip_id, claim_token, str(exc))
         raise
     return {"ok": True}
+
+
+@app.delete("/api/clips/{clip_id}")
+def delete_clip(clip_id: int) -> ApiResponse:
+    """Удалить выпуск и локальные артефакты, не конфликтуя с публикацией."""
+    claim = db.claim_for_deletion(clip_id)
+    if claim is None:
+        clip = db.get_clip(clip_id)
+        if clip is None:
+            raise HTTPException(404, "Ролик не найден")
+        raise HTTPException(409, "Нельзя удалить ролик во время публикации")
+
+    clip, previous_status = claim
+    claim_token = str(clip["claim_token"])
+    staged = None
+    try:
+        staged = stage_clip_artifacts_for_deletion(
+            Path(str(clip["file_path"])),
+            allowed_roots=(PENDING_DIR, POSTED_DIR, REJECTED_DIR),
+        )
+        db.delete_claimed(clip_id, claim_token)
+    except ValueError as exc:
+        if staged is not None:
+            staged.rollback()
+        db.release_deletion_claim(clip_id, claim_token, previous_status, str(exc))
+        raise HTTPException(409, str(exc)) from exc
+    except BaseException as exc:
+        if staged is not None:
+            staged.rollback()
+        db.release_deletion_claim(clip_id, claim_token, previous_status, str(exc))
+        raise
+
+    cleanup_pending = False
+    try:
+        staged.commit()
+    except OSError:
+        # Запись и видимый файл уже удалены; остаток в локальной .trash можно
+        # безопасно очистить при следующем обслуживании диска.
+        cleanup_pending = True
+    return {
+        "ok": True,
+        "deleted_files": staged.file_count,
+        "cleanup_pending": cleanup_pending,
+    }
 
 
 @app.patch("/api/clips/{clip_id}")

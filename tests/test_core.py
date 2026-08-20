@@ -96,7 +96,8 @@ class SubtitleTests(unittest.TestCase):
             content = path.read_text(encoding="utf-8")
         self.assertIn("один", content)
         self.assertIn("два", content)
-        self.assertEqual(2, content.count("Dialogue:"))
+        # Одна читаемая реплика не должна мигать на каждом слове.
+        self.assertEqual(1, content.count("Dialogue:"))
 
 
 class DoramaTests(unittest.TestCase):
@@ -374,15 +375,16 @@ class JobCancellationTests(unittest.TestCase):
         self.assertEqual("cancelled", result["status"])
         with jobs_lock:
             self.assertEqual("running", jobs[first["id"]]["status"])
+            self.assertNotIn(second["id"], jobs)
         cancel_job(first["id"])
         deadline = time.time() + 2
         while time.time() < deadline:
             with jobs_lock:
-                if jobs[first["id"]]["status"] == "cancelled":
+                if first["id"] not in jobs:
                     break
             time.sleep(0.02)
         with jobs_lock:
-            self.assertEqual("cancelled", jobs[first["id"]]["status"])
+            self.assertNotIn(first["id"], jobs)
 
     def test_cancel_terminates_child_process(self):
         event = Event()

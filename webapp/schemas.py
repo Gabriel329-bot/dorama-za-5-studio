@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class StrictRequest(BaseModel):
@@ -29,6 +29,19 @@ class EpisodeRequest(StrictRequest):
     filename: str = Field(min_length=1, max_length=255)
     focus: str = Field(default="", max_length=300)
     rights_confirmed: bool
+    mode: Literal["recap", "translate"] = "recap"
+    start_seconds: float = Field(default=0.0, ge=0.0)
+    end_seconds: float | None = Field(default=None, gt=0.0)
+
+    @model_validator(mode="after")
+    def validate_interval(self) -> EpisodeRequest:
+        if self.end_seconds is None:
+            return self
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("Конец фрагмента должен быть позже начала")
+        if self.mode == "translate" and self.end_seconds - self.start_seconds > 300.01:
+            raise ValueError("Для перевода выберите фрагмент не длиннее 5 минут")
+        return self
 
 
 class PublishRequest(StrictRequest):

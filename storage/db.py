@@ -47,8 +47,6 @@ CREATE INDEX IF NOT EXISTS idx_clips_status_created
     ON clips(status, created_at, id);
 CREATE INDEX IF NOT EXISTS idx_clips_created
     ON clips(created_at DESC, id DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_clips_origin_job
-    ON clips(origin_job_id) WHERE origin_job_id IS NOT NULL;
 """
 
 _CLIP_MIGRATIONS: dict[str, str] = {
@@ -204,6 +202,76 @@ def release_claim(clip_id: int, claim_token: str, error: str | None = None) -> b
             "claimed_at = NULL, last_error = ? "
             "WHERE id = ? AND status = 'publishing' AND claim_token = ?",
             ((error or "")[:2000] or None, clip_id, claim_token),
+        )
+        return cursor.rowcount == 1
+
+
+_DELETABLE_STATUSES = frozenset({"pending", "posted", "rejected"})
+
+
+def claim_for_deletion(clip_id: int) -> tuple[sqlite3.Row, str] | None:
+    """Атомарно заблокировать клип перед удалением файла и записи.
+
+    Возвращает строку уже со статусом ``deleting`` и её предыдущий статус.
+    Активная публикация намеренно не прерывается удалением.
+    """
+    token = uuid.uuid4().hex
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM clips WHERE id = ? AND status IN ('pending', 'posted', 'rejected')",
+            (clip_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        previous_status = str(row["status"])
+        cursor = conn.execute(
+            "UPDATE clips SET status = 'deleting', claim_token = ?, claimed_by = 'delete', "
+            "claimed_at = ?, last_error = NULL WHERE id = ? AND status = ?",
+            (token, _utc_now(), clip_id, previous_status),
+        )
+        if cursor.rowcount != 1:
+            return None
+        claimed = conn.execute(
+            "SELECT * FROM clips WHERE id = ? AND status = 'deleting' AND claim_token = ?",
+            (clip_id, token),
+        ).fetchone()
+        if claimed is None:
+            raise RuntimeError(f"Не удалось получить claim удаления ролика #{clip_id}")
+        return cast(sqlite3.Row, claimed), previous_status
+
+
+def delete_claimed(clip_id: int, claim_token: str) -> None:
+    """Удалить запись только если вызывающий всё ещё владеет claim удаления."""
+    with _connect() as conn:
+        cursor = conn.execute(
+            "DELETE FROM clips WHERE id = ? AND status = 'deleting' AND claim_token = ?",
+            (clip_id, claim_token),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(f"Claim удаления ролика #{clip_id} потерян")
+
+
+def release_deletion_claim(
+    clip_id: int,
+    claim_token: str,
+    previous_status: str,
+    error: str | None = None,
+) -> bool:
+    """Вернуть клип в исходный статус, если файловое удаление не удалось."""
+    if previous_status not in _DELETABLE_STATUSES:
+        raise ValueError(f"Недопустимый исходный статус удаления: {previous_status}")
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE clips SET status = ?, claim_token = NULL, claimed_by = NULL, "
+            "claimed_at = NULL, last_error = ? "
+            "WHERE id = ? AND status = 'deleting' AND claim_token = ?",
+            (
+                previous_status,
+                (error or "")[:2000] or None,
+                clip_id,
+                claim_token,
+            ),
         )
         return cursor.rowcount == 1
 

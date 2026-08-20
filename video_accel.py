@@ -63,7 +63,9 @@ def _probe_encoder(encoder: str) -> bool:
         "-hide_banner",
         "-loglevel", "error",
         "-f", "lavfi",
-        "-i", "color=c=black:s=64x64:r=1:d=0.1",
+        # Современный NVENC отклоняет 64x64 как размер ниже аппаратного минимума,
+        # что раньше давало ложный fallback на QSV/CPU.
+        "-i", "color=c=black:s=256x256:r=1:d=0.1",
         "-frames:v", "1",
         *encoder_options(encoder),
         "-f", "null",

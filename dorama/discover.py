@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import math
 import re
-import sys
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -14,6 +13,7 @@ from typing import Any
 import requests
 
 from job_control import checkpoint, run_process, submit_cancellable
+from runtime_support import python_module_command
 from settings import CONFIG
 
 USER_AGENT = "DoramaRadar/2.0 (+local metadata search)"
@@ -141,14 +141,12 @@ def search_youtube(query: str, limit: int = 10) -> list[Trend]:
     variants = query_variants(query)
     for variant in variants:
         checkpoint()
-        command = [
-            sys.executable,
-            "-m",
+        command = python_module_command(
             "yt_dlp",
             "--flat-playlist",
             "--dump-single-json",
             f"ytsearch{_quota(limit, variants)}:{variant}",
-        ]
+        )
         result = run_process(command, capture_output=True, text=True, timeout=90)
         if result.returncode != 0:
             continue

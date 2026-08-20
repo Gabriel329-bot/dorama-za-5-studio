@@ -15,6 +15,7 @@ from dorama.render import create_cover, render_video
 from dorama.script import DoramaScript, create_script
 from dorama.speech import synthesize
 from job_control import checkpoint
+from media_pipeline.resources import unload_ollama_model
 from settings import CONFIG, PENDING_DIR
 from storage import db
 from storage.files import atomic_write_text
@@ -103,6 +104,7 @@ def create_dorama_video(
 
             print(f"[3/4] Озвучиваю: {script.title}")
             checkpoint()
+            unload_ollama_model()
             asyncio.run(synthesize(script.narration, audio_path, cfg["voice"], cfg["rate"]))
             create_cover(script.title, cover_path)
 

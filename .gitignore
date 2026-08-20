@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 venv/
+audio-venv/
 tts-venv/
 __pycache__/
 *.pyc
@@ -13,6 +14,8 @@ htmlcov/
 .DS_Store
 Thumbs.db
 *.log
+/Dorama Studio Server.exe
+/build/
 input/*
 !input/.gitkeep
 output/**

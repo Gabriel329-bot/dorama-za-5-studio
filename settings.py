@@ -5,7 +5,17 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
-ROOT_DIR = Path(__file__).resolve().parent
+configured_root = os.environ.get("DORAMA_HOME", "").strip()
+ROOT_DIR = (
+    Path(configured_root).expanduser().resolve()
+    if configured_root
+    else Path(__file__).resolve().parent
+)
+
+if not (ROOT_DIR / "config.yaml").is_file():
+    raise FileNotFoundError(
+        f"Не найден config.yaml в рабочей папке приложения: {ROOT_DIR}"
+    )
 
 load_dotenv(ROOT_DIR / ".env")
 

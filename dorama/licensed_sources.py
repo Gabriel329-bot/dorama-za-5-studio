@@ -5,7 +5,6 @@ import json
 import math
 import re
 import subprocess
-import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -25,6 +24,7 @@ from job_control import (
     run_process,
     submit_cancellable,
 )
+from runtime_support import python_module_command
 from settings import CONFIG, INPUT_DIR, PENDING_DIR
 from storage.files import atomic_write_text
 
@@ -47,7 +47,7 @@ class LicensedCandidate:
 
 
 def _run_yt_dlp(arguments: list[str], timeout: int = 180) -> str:
-    command = [sys.executable, "-m", "yt_dlp", *arguments]
+    command = python_module_command("yt_dlp", *arguments)
     result = run_process(command, capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:
         raise RuntimeError(result.stderr[-2000:] or "yt-dlp завершился с ошибкой")

@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -15,9 +16,21 @@ from telegram.ext import MessageHandler
 from config_store import update_yaml_text
 from dorama.licensed_sources import LicensedCandidate, _download_direct
 from dorama.render import _fit_audio
-from dorama.source_pipeline import _parse_json_response
+from dorama.source_pipeline import (
+    _NARRATION_SCHEMA,
+    TimelineItem,
+    _align_translation,
+    _ask_ollama,
+    _grow_narration,
+    _load_translation_cache,
+    _parse_json_response,
+    _require_russian_narration,
+    _russian_word_count,
+    _translate_timeline,
+)
 from dorama.speech import _quality_gate, split_for_tts
 from job_control import JobCancelled, cancellation_scope, checkpoint, submit_cancellable
+from storage import db
 from telegram_bot import bot, keyboards
 from webapp.app import PipelineSettingsRequest, save_pipeline_settings
 
@@ -174,6 +187,121 @@ class NarrationAndAudioRegressionTests(unittest.TestCase):
         self.assertEqual({"ok": 1}, _parse_json_response("```json\n{\"ok\":1}\n```"))
         self.assertEqual({"ok": 2}, _parse_json_response("Ответ модели: {\"ok\":2} после JSON"))
 
+    def test_json_parser_recovers_common_ollama_wrappers(self):
+        self.assertEqual(
+            {"narration": "текст"},
+            _parse_json_response('"{\\"narration\\":\\"текст\\"}"'),
+        )
+        self.assertEqual(
+            {"narration": "текст"},
+            _parse_json_response('[{"narration":"текст"}]'),
+        )
+        self.assertEqual(
+            {"narration": "текст"},
+            _parse_json_response('{"response":{"narration":"текст"}}'),
+        )
+
+    @patch("dorama.source_pipeline.ollama_generate")
+    def test_ollama_request_uses_schema_and_output_budget(self, generate):
+        generate.return_value = '{"narration":"готово"}'
+
+        result = _ask_ollama("prompt", schema=_NARRATION_SCHEMA)
+
+        self.assertEqual({"narration": "готово"}, result)
+        payload = generate.call_args.args[1]
+        self.assertEqual(_NARRATION_SCHEMA, payload["format"])
+        self.assertEqual(4096, payload["options"]["num_predict"])
+        self.assertIn("только на естественном русском", payload["system"])
+
+    def test_russian_narration_validation_rejects_chinese_response(self):
+        self.assertEqual(0, _russian_word_count("这是一个中文故事。"))
+        with self.assertRaisesRegex(ValueError, "не на русском"):
+            _require_russian_narration({"narration": "这是一个中文故事。"})
+
+        russian = " ".join(["Это"] * 12)
+        _require_russian_narration({"narration": russian})
+
+    @patch("dorama.source_pipeline._ask_ollama")
+    def test_timeline_translation_preserves_program_owned_timestamps(self, ask):
+        source = [
+            TimelineItem(1.5, 10.0, "第一段"),
+            TimelineItem(10.0, 20.25, "第二段"),
+        ]
+        ask.return_value = {
+            "items": [
+                {"text": " ".join(["Первый"] * 6)},
+                {"text": " ".join(["Второй"] * 6)},
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "dorama.source_pipeline._translation_cache_path",
+            return_value=Path(tmp) / "translation.json",
+        ):
+            translated = _translate_timeline(source)
+
+        self.assertEqual((1.5, 10.0), (translated[0].start, translated[0].end))
+        self.assertEqual((10.0, 20.25), (translated[1].start, translated[1].end))
+        self.assertEqual(1, ask.call_count)
+
+    def test_translation_is_redistributed_when_model_changes_item_count(self):
+        source = [
+            TimelineItem(0.0, 10.0, "короткий"),
+            TimelineItem(10.0, 30.0, "намного более длинный исходный сегмент"),
+        ]
+
+        aligned = _align_translation(
+            source,
+            ["один два три четыре пять шесть семь восемь девять десять"],
+        )
+
+        self.assertEqual((0.0, 10.0), (aligned[0].start, aligned[0].end))
+        self.assertEqual((10.0, 30.0), (aligned[1].start, aligned[1].end))
+        self.assertEqual(10, len(" ".join(item.text for item in aligned).split()))
+        self.assertGreater(len(aligned[1].text.split()), len(aligned[0].text.split()))
+
+    def test_translation_cache_preserves_timestamps(self):
+        source = [TimelineItem(2.0, 8.0, "中文")]
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "translation.json"
+            cache.write_text(
+                '{"texts":["Это сохранённый естественный русский перевод исходного временного сегмента, который программа использует при повторном запуске"]}',
+                encoding="utf-8",
+            )
+
+            translated = _load_translation_cache(cache, source)
+
+        self.assertIsNotNone(translated)
+        assert translated is not None
+        self.assertEqual((2.0, 8.0), (translated[0].start, translated[0].end))
+
+    @patch("dorama.source_pipeline._extend_narration")
+    @patch("dorama.source_pipeline._expand_narration")
+    def test_narration_growth_never_accepts_shorter_rewrite(self, expand, extend):
+        original = " ".join(["Начало"] * 374)
+        expand.return_value = " ".join(["Короче"] * 120)
+        extend.side_effect = [
+            " ".join(["Продолжение"] * 130),
+            " ".join(["Финал"] * 110),
+        ]
+
+        result = _grow_narration(original, [], "", 680)
+
+        self.assertEqual(614, _russian_word_count(result))
+        self.assertTrue(result.startswith(original))
+        self.assertEqual(2, extend.call_count)
+
+    @patch("dorama.source_pipeline._extend_narration")
+    @patch("dorama.source_pipeline._expand_narration")
+    def test_narration_growth_accepts_many_small_additions(self, expand, extend):
+        original = " ".join(["Начало"] * 122)
+        expand.return_value = " ".join(["Короче"] * 80)
+        extend.side_effect = [" ".join([f"Блок{index}"] * 44) for index in range(12)]
+
+        result = _grow_narration(original, [], "", 680)
+
+        self.assertEqual(606, _russian_word_count(result))
+        self.assertEqual(11, extend.call_count)
     def test_very_short_audio_is_not_stretched_to_five_minutes(self):
         with (
             patch("dorama.render._audio_duration", return_value=112.0),
@@ -204,6 +332,44 @@ class NarrationAndAudioRegressionTests(unittest.TestCase):
                 )
             self.assertEqual("edge-qa-retry", provider)
             self.assertEqual(b"retry-audio", output.read_bytes())
+
+
+class DatabaseMigrationRegressionTests(unittest.TestCase):
+    def test_legacy_clips_table_adds_origin_job_before_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "legacy.db"
+            connection = sqlite3.connect(database)
+            connection.execute(
+                """
+                CREATE TABLE clips (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_path TEXT NOT NULL,
+                    caption TEXT NOT NULL,
+                    source_video TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    platform TEXT,
+                    created_at TEXT NOT NULL,
+                    posted_at TEXT
+                )
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            with patch.object(db, "DB_PATH", database):
+                db.init_db()
+
+            connection = sqlite3.connect(database)
+            columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(clips)")
+            }
+            indexes = {
+                str(row[1]) for row in connection.execute("PRAGMA index_list(clips)")
+            }
+            connection.close()
+
+        self.assertIn("origin_job_id", columns)
+        self.assertIn("idx_clips_origin_job", indexes)
 
 
 class DownloadRegressionTests(unittest.TestCase):

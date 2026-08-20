@@ -29,6 +29,44 @@ render:
   highlight_color: '&H0000D7FF'  # ASS BGR: жёлтый — текущее слово
   base_color: '&H00FFFFFF'       # белый — обычный текст
 
+audio_processing:
+  voice_isolation:
+    enabled: true
+    python_path: audio-venv/Scripts/python.exe
+    model: htdemucs
+    device: cuda
+    segment_seconds: 7       # безопасно для RTX 3060 6 ГБ
+    overlap: 0.25
+    shifts: 1
+    cpu_fallback: true
+    timeout_seconds: 3600
+  loudness:
+    background_lufs: -24.0   # EBU R128 bed до ducking
+    voice_lufs: -16.0
+    final_lufs: -14.0
+    true_peak_db: -1.5
+    codec_headroom_db: 2.1  # запас лимитера под inter-sample peak после AAC
+    lra: 11.0
+    voice_lra: 7.0
+  ducking:
+    threshold: 0.035
+    ratio: 8.0
+    attack_ms: 18.0
+    release_ms: 280.0
+
+subtitles:
+  min_cps: 12.0
+  max_cps: 17.0
+  max_cpl: 42
+  max_lines: 2
+  min_duration: 0.9
+  max_duration: 6.0
+  gap_seconds: 0.033333
+  frame_rate: 30.0
+  scene_threshold: 0.32
+  scene_snap_seconds: 0.16
+  max_word_gap: 0.75
+
 publishing:
   telegram:
     enabled: false                    # включить после заполнения TELEGRAM_* в .env
@@ -69,7 +107,6 @@ episode:
   target_narration_words: 680
   scene_count: 9
   source_language: auto
-  original_audio_volume: 0.16
   require_rights_confirmation: true
 
 licensed_sources:

@@ -1,12 +1,15 @@
 """Транскрибация видео с CUDA fallback и дисковым кэшем результата."""
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
+import math
 import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 
 _cuda_dll_handles: list[object] = []
 
@@ -16,7 +19,10 @@ def _configure_cuda_dlls() -> None:
     if os.name != "nt" or not hasattr(os, "add_dll_directory"):
         return
     site_packages = Path(sys.executable).resolve().parent.parent / "Lib" / "site-packages"
+    project_root = Path(os.environ.get("DORAMA_HOME", "")).resolve()
     candidates = (
+        project_root / "venv" / "Lib" / "site-packages" / "nvidia" / "cublas" / "bin",
+        project_root / "venv" / "Lib" / "site-packages" / "nvidia" / "cudnn" / "bin",
         site_packages / "nvidia" / "cublas" / "bin",
         site_packages / "nvidia" / "cudnn" / "bin",
     )
@@ -36,11 +42,13 @@ from faster_whisper import (  # type: ignore[import-untyped]
 )
 
 from job_control import checkpoint
+from media_pipeline.resources import accelerator_slot
 from settings import CACHE_DIR, CONFIG
 from storage.files import atomic_write_text
 
 _model_cache: dict[tuple[str, str, str], WhisperModel] = {}
-CACHE_VERSION = 1
+_model_lock = RLock()
+CACHE_VERSION = 2
 
 
 @dataclass
@@ -74,6 +82,13 @@ def _get_model(device: str | None = None) -> WhisperModel:
     return _model_cache[key]
 
 
+def release_models() -> None:
+    """Освободить модели Whisper перед другим GPU-этапом."""
+    with _model_lock, accelerator_slot("whisper"):
+        _model_cache.clear()
+        gc.collect()
+
+
 def _transcript_cache_key(video_path: str | Path, language: str | None) -> str:
     path = Path(video_path).resolve()
     stat = path.stat()
@@ -102,10 +117,27 @@ def _load_cached_transcript(video_path: str | Path, language: str | None) -> Tra
         payload = json.loads(path.read_text(encoding="utf-8"))
         if payload.get("version") != CACHE_VERSION:
             return None
-        words = [
-            Word(str(item["text"]), float(item["start"]), float(item["end"]))
-            for item in payload["words"]
-        ]
+        words: list[Word] = []
+        previous_start = 0.0
+        for item in payload["words"]:
+            word = Word(
+                str(item["text"]),
+                float(item["start"]),
+                float(item["end"]),
+            )
+            if (
+                not word.text
+                or not all(
+                    math.isfinite(value)
+                    for value in (word.start, word.end)
+                )
+                or word.start < 0
+                or word.end <= word.start
+                or word.start + 0.25 < previous_start
+            ):
+                raise ValueError("Некорректные таймкоды в кэше Whisper")
+            previous_start = word.start
+            words.append(word)
         if not words:
             return None
         return Transcript(str(payload["full_text"]), words)
@@ -176,17 +208,41 @@ def transcribe(video_path: str, language: str | None = None) -> Transcript:
 
     configured_device = str(CONFIG["whisper"].get("device", "cpu"))
     try:
-        result = _run_transcription(_get_model(configured_device), video_path, selected_language)
-    except Exception as exc:
-        can_fallback = (
-            configured_device == "cuda"
-            and CONFIG["whisper"].get("cuda_fallback", True)
-            and _is_cuda_failure(exc)
-        )
-        if not can_fallback:
-            raise
-        print(f"  ! CUDA для Whisper недоступна, продолжаю на CPU: {type(exc).__name__}")
-        result = _run_transcription(_get_model("cpu"), video_path, selected_language)
-    checkpoint()
-    _save_cached_transcript(video_path, selected_language, result)
-    return result
+        with _model_lock:
+            try:
+                if configured_device == "cuda":
+                    with accelerator_slot("whisper"):
+                        result = _run_transcription(
+                            _get_model(configured_device),
+                            video_path,
+                            selected_language,
+                        )
+                else:
+                    result = _run_transcription(
+                        _get_model(configured_device),
+                        video_path,
+                        selected_language,
+                    )
+            except Exception as exc:
+                can_fallback = (
+                    configured_device == "cuda"
+                    and CONFIG["whisper"].get("cuda_fallback", True)
+                    and _is_cuda_failure(exc)
+                )
+                if not can_fallback:
+                    raise
+                print(
+                    "  ! CUDA для Whisper недоступна, продолжаю на CPU: "
+                    f"{type(exc).__name__}"
+                )
+                result = _run_transcription(
+                    _get_model("cpu"),
+                    video_path,
+                    selected_language,
+                )
+        checkpoint()
+        _save_cached_transcript(video_path, selected_language, result)
+        return result
+    except BaseException:
+        release_models()
+        raise

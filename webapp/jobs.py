@@ -129,12 +129,16 @@ class JobManager:
             return 0
         self.store.initialize()
         recovered: list[str] = []
+        cancelled: list[str] = []
         with self.lock:
             for stored in reversed(
                 self.store.load_for_recovery(self.max_history)
             ):
                 job = self._record_from_stored(stored)
                 job_id = job["id"]
+                if job["status"] == "cancelled":
+                    cancelled.append(job_id)
+                    continue
                 self.jobs[job_id] = job
                 self._specs[job_id] = JobSpec(
                     payload=stored.payload,
@@ -166,6 +170,7 @@ class JobManager:
                     job["finished_at"] = _now_iso()
                     self._persist_locked(job_id)
             self._prune_locked()
+            self.store.delete(cancelled)
         for job_id in recovered:
             self._enqueue_persistent(job_id)
         return len(recovered)
@@ -343,6 +348,7 @@ class JobManager:
             "Отменено пользователем",
             "Процесс остановлен",
         )
+        self._discard_jobs_locked([job_id])
 
     def _pause_locked(self, job_id: str, message: str) -> None:
         job = self.jobs.get(job_id)
@@ -415,11 +421,25 @@ class JobManager:
                 self._finish_locked(
                     job_id, "cancelled", "Убрано из очереди"
                 )
+                self._discard_jobs_locked([job_id])
+                status = "cancelled"
             else:
                 job["status"] = "cancelling"
                 job["message"] = "Останавливаю выбранный процесс…"
                 self._persist_locked(job_id)
-            return {"id": job_id, "status": job["status"]}
+                status = "cancelling"
+            return {"id": job_id, "status": status}
+
+    def clear_terminal_history(self) -> int:
+        """Remove finished diagnostics without touching active or paused work."""
+        with self.lock:
+            job_ids = [
+                job_id
+                for job_id, job in self.jobs.items()
+                if job["status"] in TERMINAL_STATUSES
+            ]
+            self._discard_jobs_locked(job_ids)
+            return len(job_ids)
 
     def recent(self, limit: int = 10) -> list[JobRecord]:
         with self.lock:
@@ -456,12 +476,16 @@ class JobManager:
             : max(0, len(self.jobs) - self.max_history)
         ]:
             job_id = str(item["id"])
+            deleted.append(job_id)
+        self._discard_jobs_locked(deleted)
+
+    def _discard_jobs_locked(self, job_ids: list[str]) -> None:
+        for job_id in job_ids:
             self.jobs.pop(job_id, None)
             self.controls.pop(job_id, None)
             self._specs.pop(job_id, None)
-            deleted.append(job_id)
         if self.store is not None:
-            self.store.delete(deleted)
+            self.store.delete(job_ids)
 
     def shutdown(self) -> None:
         """Cooperatively stop work and durably mark it for the next start."""

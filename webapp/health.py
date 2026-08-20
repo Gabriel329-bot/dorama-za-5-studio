@@ -18,6 +18,10 @@ class HealthService:
 
     @staticmethod
     def _scheduler_enabled() -> bool:
+        from background_services import scheduler_service
+
+        if scheduler_service.running:
+            return True
         try:
             result = subprocess.run(
                 ["schtasks", "/Query", "/TN", "ContentAutomationScheduler"],

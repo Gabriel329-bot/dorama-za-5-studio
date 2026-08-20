@@ -541,6 +541,11 @@ def stop_bot_thread(timeout: float = 10.0) -> None:
             _bot_stop_event = None
 
 
+def bot_is_running() -> bool:
+    with _bot_lock:
+        return _bot_thread is not None and _bot_thread.is_alive()
+
+
 def run_bot() -> None:
     if not BOT_TOKEN:
         log.error("TELEGRAM_BOT_TOKEN не задан — бот не запускается")

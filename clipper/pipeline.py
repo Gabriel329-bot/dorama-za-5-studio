@@ -7,8 +7,9 @@ from pathlib import Path
 
 from clipper.highlight import Highlight, pick_highlights
 from clipper.render import render_clip
-from clipper.transcribe import transcribe
+from clipper.transcribe import release_models, transcribe
 from job_control import checkpoint
+from media_pipeline.resources import unload_ollama_model
 from settings import PENDING_DIR
 from storage import db
 from storage.files import atomic_write_text
@@ -56,6 +57,7 @@ def process_video(
     print(f"[1/3] Транскрибирую {source.name}...")
     checkpoint()
     transcript = transcribe(str(source))
+    release_models()
 
     work_dir = PENDING_DIR / ".work"
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -84,6 +86,7 @@ def process_video(
         print("Модель не нашла подходящих отрывков в этом видео.")
         return []
 
+    unload_ollama_model()
     print(f"[3/3] Рендерю {len(highlights)} клип(ов)...")
     created: list[Path] = []
     for idx, hl in enumerate(highlights, start=1):

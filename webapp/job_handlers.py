@@ -38,7 +38,7 @@ def execute_persistent_job(
     payload: JsonDict,
 ) -> object:
     """Dispatch a validated durable payload without retaining lambdas in RAM."""
-    if kind in {"dorama", "licensed-dorama", "episode"}:
+    if kind in {"dorama", "licensed-dorama", "episode", "literal-translation"}:
         completed = _completed_output(job_id)
         if completed is not None:
             print(f"↻ Использую уже готовый результат: {completed.name}")
@@ -74,6 +74,16 @@ def execute_persistent_job(
         return create_episode_recap(
             _input_file(payload),
             focus=str(payload.get("focus") or "").strip(),
+            operation_id=job_id,
+        )
+
+    if kind == "literal-translation":
+        from dorama.literal_translation import create_literal_translation
+
+        return create_literal_translation(
+            _input_file(payload),
+            start_seconds=float(payload.get("start_seconds") or 0.0),
+            end_seconds=float(payload["end_seconds"]),
             operation_id=job_id,
         )
 
