@@ -122,7 +122,16 @@ function renderJobs(jobs) {
 }
 
 function jobStatus(status) {
-  return { queued: "очередь", running: "в работе", cancelling: "останавливаю", cancelled: "отменено", succeeded: "готово", failed: "ошибка" }[status] || status;
+  return {
+    queued: "очередь",
+    running: "в работе",
+    cancelling: "останавливаю",
+    paused: "приостановлено",
+    attention: "нужна проверка",
+    cancelled: "отменено",
+    succeeded: "готово",
+    failed: "ошибка",
+  }[status] || status;
 }
 
 $("#jobsList").addEventListener("click", async event => {

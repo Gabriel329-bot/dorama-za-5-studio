@@ -42,7 +42,16 @@ except ValueError:
     ALLOWED_USER = 0
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
-STATUS_EMOJI = {"running": "🔄", "queued": "⏳", "succeeded": "✅", "failed": "❌", "cancelled": "🚫", "cancelling": "⏹"}
+STATUS_EMOJI = {
+    "running": "🔄",
+    "queued": "⏳",
+    "paused": "⏸",
+    "attention": "⚠️",
+    "succeeded": "✅",
+    "failed": "❌",
+    "cancelled": "🚫",
+    "cancelling": "⏹",
+}
 _bot_thread: Thread | None = None
 _bot_stop_event: ThreadEvent | None = None
 _bot_lock = Lock()
@@ -136,7 +145,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         stats = dash["stats"]
         system = dash["system"]
         jobs = dash.get("jobs", [])
-        active = [j for j in jobs if j["status"] in ("running", "queued", "cancelling")]
+        active = [
+            j
+            for j in jobs
+            if j["status"] in ("running", "queued", "cancelling", "paused")
+        ]
+        attention = [j for j in jobs if j["status"] == "attention"]
         lines = [
             "📊 *Статус системы*\n",
             f"📂 В очереди: *{stats['pending']}*  ✅ Опубликовано: *{stats['posted']}*",
@@ -151,6 +165,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 lines.append(f"  {emoji} `{j['id']}` {j['title'][:40]}  {_progress_bar(j['progress'])}")
         else:
             lines.append("\n⏸ Активных задач нет")
+        if attention:
+            lines.append(
+                f"\n⚠️ Требуют проверки после перезапуска: *{len(attention)}*"
+            )
+            for job in attention[:3]:
+                lines.append(f"  ⚠️ `{job['id']}` {job['title'][:40]}")
         await msg.edit_text("\n".join(lines), parse_mode="Markdown", reply_markup=kb.back_main())
         return
 

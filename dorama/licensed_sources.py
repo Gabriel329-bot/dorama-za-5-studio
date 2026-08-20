@@ -25,7 +25,7 @@ from job_control import (
     run_process,
     submit_cancellable,
 )
-from settings import CONFIG, INPUT_DIR
+from settings import CONFIG, INPUT_DIR, PENDING_DIR
 from storage.files import atomic_write_text
 
 
@@ -612,14 +612,57 @@ def download_candidate(candidate: LicensedCandidate) -> tuple[Path, Path]:
     return video_path, metadata_path
 
 
-def create_licensed_dorama_video(query: str, focus: str = "", limit: int | None = None) -> Path:
-    candidate = find_licensed_candidate(query, limit)
-    video_path, metadata_path = download_candidate(candidate)
+def create_licensed_dorama_video(
+    query: str,
+    focus: str = "",
+    limit: int | None = None,
+    operation_id: str | None = None,
+) -> Path:
+    checkpoint_path = (
+        PENDING_DIR / ".work" / f"{operation_id}.licensed-source.json"
+        if operation_id
+        else None
+    )
+    restored: tuple[LicensedCandidate, Path, Path] | None = None
+    if checkpoint_path and checkpoint_path.is_file():
+        try:
+            saved = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            candidate = LicensedCandidate(**saved["candidate"])
+            video_path = Path(str(saved["video_path"]))
+            metadata_path = Path(str(saved["metadata_path"]))
+            if video_path.is_file() and metadata_path.is_file():
+                restored = candidate, video_path, metadata_path
+        except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+            checkpoint_path.unlink(missing_ok=True)
+    if restored is None:
+        candidate = find_licensed_candidate(query, limit)
+        video_path, metadata_path = download_candidate(candidate)
+        if checkpoint_path:
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(
+                checkpoint_path,
+                json.dumps(
+                    {
+                        "candidate": asdict(candidate),
+                        "video_path": str(video_path),
+                        "metadata_path": str(metadata_path),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+    else:
+        candidate, video_path, metadata_path = restored
+        print(f"[1/7] ↻ Восстановлен источник: {candidate.title}")
     print(f"  Лицензия сохранена: {metadata_path.name}")
     print("[3/7] Передаю материал в пятиминутный монтаж...")
-    return create_episode_recap(
+    result = create_episode_recap(
         video_path,
         focus=focus or f"объяснить, почему материал связан с темой «{query}», без выдумывания фактов",
         source_info=asdict(candidate),
         progress_offset=2,
+        operation_id=operation_id,
     )
+    if checkpoint_path:
+        checkpoint_path.unlink(missing_ok=True)
+    return result

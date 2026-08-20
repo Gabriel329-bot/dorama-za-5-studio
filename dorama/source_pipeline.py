@@ -53,6 +53,34 @@ class EpisodePlan:
     scenes: list[SourceScene]
 
 
+def _load_plan_checkpoint(
+    path: Path,
+) -> tuple[EpisodePlan, int] | None:
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        raw_plan = data["plan"]
+        plan = EpisodePlan(
+            title=str(raw_plan["title"]),
+            caption=str(raw_plan["caption"]),
+            narration=str(raw_plan["narration"]),
+            hashtags=[str(item) for item in raw_plan["hashtags"]],
+            scenes=[
+                SourceScene(
+                    start=float(item["start"]),
+                    end=float(item["end"]),
+                    reason=str(item.get("reason") or ""),
+                )
+                for item in raw_plan["scenes"]
+            ],
+        )
+        return plan, int(data.get("transcript_words") or 0)
+    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+        path.unlink(missing_ok=True)
+        return None
+
+
 def _slug(text: str) -> str:
     value = re.sub(r"[^\wа-яА-ЯёЁ-]+", "_", text, flags=re.UNICODE).strip("_")
     return value[:52] or "licensed_dorama"
@@ -345,6 +373,7 @@ def create_episode_recap(
     focus: str = "",
     source_info: dict[str, Any] | None = None,
     progress_offset: int = 0,
+    operation_id: str | None = None,
 ) -> Path:
     cfg = CONFIG["episode"]
     source = Path(source_video)
@@ -359,10 +388,15 @@ def create_episode_recap(
         raise ValueError("Некорректное смещение прогресса")
 
     target_duration = float(cfg["target_duration_seconds"])
-    artifact_id = _artifact_id()
+    artifact_id = operation_id or _artifact_id()
     work_root = PENDING_DIR / ".work"
     work_root.mkdir(parents=True, exist_ok=True)
     PENDING_DIR.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = (
+        work_root / f"{operation_id}.episode-plan.json"
+        if operation_id
+        else None
+    )
     output_path = PENDING_DIR / f"{artifact_id}_{_slug(source.stem)}.mp4"
     audit_path = output_path.with_suffix(".plan.json")
     total_steps = 5 + progress_offset
@@ -378,22 +412,63 @@ def create_episode_recap(
             if duration < 20:
                 raise RuntimeError("Исходник слишком короткий: нужно хотя бы 20 секунд")
 
-            print(
-                f"[{2 + progress_offset}/{total_steps}] "
-                "Распознаю речь и строю таймлайн..."
+            saved_plan = (
+                _load_plan_checkpoint(checkpoint_path)
+                if checkpoint_path
+                else None
             )
-            checkpoint()
-            transcript = transcribe(
-                str(source), language=str(cfg.get("source_language", "auto"))
-            )
-            print(f"  Распознано {len(transcript.words)} слов")
+            if saved_plan is None:
+                print(
+                    f"[{2 + progress_offset}/{total_steps}] "
+                    "Распознаю речь и строю таймлайн..."
+                )
+                checkpoint()
+                transcript = transcribe(
+                    str(source),
+                    language=str(cfg.get("source_language", "auto")),
+                )
+                transcript_word_count = len(transcript.words)
+                print(f"  Распознано {transcript_word_count} слов")
 
-            print(
-                f"[{3 + progress_offset}/{total_steps}] "
-                "Выбираю ключевые сцены и пишу русский пересказ..."
-            )
-            checkpoint()
-            plan = _create_plan(transcript, duration, source.name, selected_focus)
+                print(
+                    f"[{3 + progress_offset}/{total_steps}] "
+                    "Выбираю ключевые сцены и пишу русский пересказ..."
+                )
+                checkpoint()
+                plan = _create_plan(
+                    transcript,
+                    duration,
+                    source.name,
+                    selected_focus,
+                )
+                if checkpoint_path:
+                    atomic_write_text(
+                        checkpoint_path,
+                        json.dumps(
+                            {
+                                "transcript_words": transcript_word_count,
+                                "plan": {
+                                    **asdict(plan),
+                                    "scenes": [
+                                        asdict(scene)
+                                        for scene in plan.scenes
+                                    ],
+                                },
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                    )
+            else:
+                plan, transcript_word_count = saved_plan
+                print(
+                    f"[{2 + progress_offset}/{total_steps}] "
+                    "↻ Расшифровка восстановлена из контрольной точки"
+                )
+                print(
+                    f"[{3 + progress_offset}/{total_steps}] "
+                    "↻ План пересказа восстановлен"
+                )
             audio_path = work_dir / "voice.mp3"
             print(f"[{4 + progress_offset}/{total_steps}] Озвучиваю: {plan.title}")
             checkpoint()
@@ -442,7 +517,7 @@ def create_episode_recap(
                     "source": str(source),
                     "source_info": source_info,
                     "duration": duration,
-                    "transcript_words": len(transcript.words),
+                    "transcript_words": transcript_word_count,
                     "focus": selected_focus,
                     "title": plan.title,
                     "caption": plan.caption,
@@ -456,12 +531,19 @@ def create_episode_recap(
         )
         checkpoint()
         db.init_db()
-        db.add_pending(str(output_path), caption, source_ref)
+        db.add_pending(
+            str(output_path),
+            caption,
+            source_ref,
+            origin_job_id=operation_id,
+        )
     except BaseException:
         output_path.unlink(missing_ok=True)
         audit_path.unlink(missing_ok=True)
         raise
 
+    if checkpoint_path:
+        checkpoint_path.unlink(missing_ok=True)
     print(f"Готово: {output_path.name}")
     print("Ролик добавлен в очередь проверки и не опубликован автоматически до следующего слота.")
     return Path(output_path)

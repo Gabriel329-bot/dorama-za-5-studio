@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS clips (
     claim_token TEXT,
     claimed_by TEXT,
     claimed_at TEXT,
-    last_error TEXT
+    last_error TEXT,
+    origin_job_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS schedule_log (
@@ -46,6 +47,8 @@ CREATE INDEX IF NOT EXISTS idx_clips_status_created
     ON clips(status, created_at, id);
 CREATE INDEX IF NOT EXISTS idx_clips_created
     ON clips(created_at DESC, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_clips_origin_job
+    ON clips(origin_job_id) WHERE origin_job_id IS NOT NULL;
 """
 
 _CLIP_MIGRATIONS: dict[str, str] = {
@@ -53,6 +56,7 @@ _CLIP_MIGRATIONS: dict[str, str] = {
     "claimed_by": "TEXT",
     "claimed_at": "TEXT",
     "last_error": "TEXT",
+    "origin_job_id": "TEXT",
 }
 
 
@@ -93,20 +97,52 @@ def init_db() -> None:
                 ON clips(status, created_at, id);
             CREATE INDEX IF NOT EXISTS idx_clips_created
                 ON clips(created_at DESC, id DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_clips_origin_job
+                ON clips(origin_job_id) WHERE origin_job_id IS NOT NULL;
             """
         )
 
 
-def add_pending(file_path: str, caption: str, source_video: str) -> int:
+def add_pending(
+    file_path: str,
+    caption: str,
+    source_video: str,
+    origin_job_id: str | None = None,
+) -> int:
     with _connect() as conn:
+        if origin_job_id:
+            existing = conn.execute(
+                "SELECT id FROM clips WHERE origin_job_id = ?",
+                (origin_job_id,),
+            ).fetchone()
+            if existing is not None:
+                return int(existing["id"])
         cursor = conn.execute(
-            "INSERT INTO clips (file_path, caption, source_video, status, created_at) "
-            "VALUES (?, ?, ?, 'pending', ?)",
-            (file_path, caption, source_video, _utc_now()),
+            "INSERT INTO clips "
+            "(file_path, caption, source_video, status, created_at, origin_job_id) "
+            "VALUES (?, ?, ?, 'pending', ?, ?)",
+            (
+                file_path,
+                caption,
+                source_video,
+                _utc_now(),
+                origin_job_id,
+            ),
         )
         if cursor.lastrowid is None:
             raise RuntimeError("SQLite не вернул ID добавленного ролика")
         return int(cursor.lastrowid)
+
+
+def get_clip_by_origin_job(origin_job_id: str) -> sqlite3.Row | None:
+    if not origin_job_id:
+        return None
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM clips WHERE origin_job_id = ?",
+            (origin_job_id,),
+        ).fetchone()
+        return cast(sqlite3.Row | None, row)
 
 
 def get_oldest_pending() -> sqlite3.Row | None:

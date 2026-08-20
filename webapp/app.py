@@ -4,7 +4,7 @@ from __future__ import annotations
 import mimetypes
 import re
 import sqlite3
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -30,6 +30,8 @@ from settings import (
 from storage import db
 from storage.files import move_to_unique
 from webapp.health import HealthService
+from webapp.job_handlers import execute_persistent_job
+from webapp.job_store import JobStore
 from webapp.jobs import JobManager, JobRecord
 from webapp.schemas import (
     CaptionRequest,
@@ -51,7 +53,13 @@ DEFAULT_MAX_UPLOAD_MB = 2048
 ApiResponse: TypeAlias = dict[str, Any]
 
 
-job_manager = JobManager(max_workers=1, max_history=100, max_log_lines=30)
+job_manager = JobManager(
+    max_workers=1,
+    max_history=100,
+    max_log_lines=30,
+    store=JobStore(),
+    persistent_handler=execute_persistent_job,
+)
 health_service = HealthService(ttl_seconds=15.0)
 
 
@@ -64,6 +72,9 @@ async def lifespan(_application: FastAPI) -> AsyncIterator[None]:
     if bot_token and user_id:
         from telegram_bot.bot import run_bot_thread
         stop_bot = run_bot_thread(bot_token, user_id)
+    recovered = job_manager.start()
+    if recovered:
+        print(f"↻ Восстановлено задач после перезапуска: {recovered}")
     try:
         yield
     finally:
@@ -99,6 +110,21 @@ def _submit_job(
     kind: str, title: str, runner: Callable[[], object]
 ) -> JobRecord:
     return job_manager.submit(kind, title, runner)
+
+
+def _submit_persistent_job(
+    kind: str,
+    title: str,
+    payload: Mapping[str, object],
+    *,
+    resumable: bool = True,
+) -> JobRecord:
+    return job_manager.submit_persistent(
+        kind,
+        title,
+        payload,
+        resumable=resumable,
+    )
 
 
 @app.post("/api/jobs/{job_id}/cancel")
@@ -217,27 +243,23 @@ def api_session() -> dict[str, str]:
 
 @app.post("/api/jobs/dorama", status_code=202)
 def create_dorama(payload: DoramaRequest) -> JobRecord:
-    from dorama.pipeline import create_dorama_video
-
-    return _submit_job(
+    return _submit_persistent_job(
         "dorama",
         f"Дорама: {payload.query}",
-        lambda: create_dorama_video(query=payload.query, limit=payload.limit),
+        {"query": payload.query, "limit": payload.limit},
     )
 
 
 @app.post("/api/jobs/licensed-dorama", status_code=202)
 def create_licensed_dorama(payload: LicensedDoramaRequest) -> JobRecord:
-    from dorama.licensed_sources import create_licensed_dorama_video
-
-    return _submit_job(
+    return _submit_persistent_job(
         "licensed-dorama",
         f"CC-поиск: {payload.query}",
-        lambda: create_licensed_dorama_video(
-            query=payload.query,
-            focus=payload.focus.strip(),
-            limit=payload.limit,
-        ),
+        {
+            "query": payload.query,
+            "focus": payload.focus.strip(),
+            "limit": payload.limit,
+        },
     )
 
 
@@ -263,12 +285,14 @@ def upload_video(file: Annotated[UploadFile, File(...)]) -> ApiResponse:
 
 @app.post("/api/jobs/clip", status_code=202)
 def create_clips(payload: ClipRequest) -> JobRecord:
-    from clipper.pipeline import process_video
-
     source = (INPUT_DIR / Path(payload.filename).name).resolve()
     if source.parent != INPUT_DIR.resolve() or not source.is_file():
         raise HTTPException(404, "Загруженный файл не найден")
-    return _submit_job("clip", f"Нарезка: {source.name}", lambda: process_video(source))
+    return _submit_persistent_job(
+        "clip",
+        f"Нарезка: {source.name}",
+        {"filename": source.name},
+    )
 
 
 @app.post("/api/jobs/episode", status_code=202)
@@ -278,12 +302,13 @@ def create_episode(payload: EpisodeRequest) -> JobRecord:
     source = (INPUT_DIR / Path(payload.filename).name).resolve()
     if source.parent != INPUT_DIR.resolve() or not source.is_file():
         raise HTTPException(404, "Загруженный файл не найден")
-    from dorama.source_pipeline import create_episode_recap
-
-    return _submit_job(
+    return _submit_persistent_job(
         "episode",
         f"Пересказ: {source.name}",
-        lambda: create_episode_recap(source, focus=payload.focus.strip()),
+        {
+            "filename": source.name,
+            "focus": payload.focus.strip(),
+        },
     )
 
 
@@ -292,12 +317,11 @@ def publish_youtube(clip_id: int, payload: PublishRequest) -> JobRecord:
     clip = db.get_clip(clip_id)
     if clip is None or clip["status"] != "pending":
         raise HTTPException(409, "В очереди нет такого ролика")
-    from publisher import youtube
-
-    return _submit_job(
+    return _submit_persistent_job(
         "youtube",
         f"YouTube: ролик #{clip_id}",
-        lambda: youtube.publish_next(clip_id=clip_id, privacy_status=payload.privacy),
+        {"clip_id": clip_id, "privacy": payload.privacy},
+        resumable=False,
     )
 
 
@@ -402,18 +426,21 @@ def save_pipeline_settings(payload: PipelineSettingsRequest) -> ApiResponse:
 
 @app.post("/api/jobs/scheduler", status_code=202)
 def run_scheduler_now() -> JobRecord:
-    from scheduler import check_and_publish
-
-    return _submit_job("scheduler", "Проверка расписания", check_and_publish)
+    return _submit_persistent_job(
+        "scheduler",
+        "Проверка расписания",
+        {},
+        resumable=False,
+    )
 
 
 @app.post("/api/jobs/doctor", status_code=202)
 def run_doctor() -> JobRecord:
-    import argparse
-
-    from cli import cmd_doctor
-
-    return _submit_job("doctor", "Проверка системы", lambda: cmd_doctor(argparse.Namespace()))
+    return _submit_persistent_job(
+        "doctor",
+        "Проверка системы",
+        {},
+    )
 
 
 app.mount("/brand", StaticFiles(directory=BRAND_DIR), name="brand")

@@ -2,19 +2,23 @@ from __future__ import annotations
 
 import io
 import tempfile
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from dorama.licensed_sources import _validate_download_url
+from job_control import cancellable_wait
 from storage import db
 from telegram_bot import api_client
 from webapp.app import app
 from webapp.health import HealthService
+from webapp.job_store import JobStore
 from webapp.jobs import JobManager
 from webapp.schemas import DoramaRequest
 from webapp.uploads import UploadTooLargeError, save_video_upload
@@ -101,6 +105,30 @@ class AtomicQueueTests(unittest.TestCase):
                     }
             self.assertIn("idx_clips_status_created", indexes)
             self.assertIn("idx_clips_created", indexes)
+            self.assertIn("idx_clips_origin_job", indexes)
+
+    def test_origin_job_prevents_duplicate_queue_items(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "queue.db"
+            with patch("storage.db.DB_PATH", database):
+                db.init_db()
+                first = db.add_pending(
+                    "first.mp4",
+                    "caption",
+                    "source",
+                    origin_job_id="job-1",
+                )
+                second = db.add_pending(
+                    "second.mp4",
+                    "caption",
+                    "source",
+                    origin_job_id="job-1",
+                )
+                row = db.get_clip_by_origin_job("job-1")
+            self.assertEqual(first, second)
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual("first.mp4", row["file_path"])
 
 
 class ResourceBoundTests(unittest.TestCase):
@@ -135,6 +163,143 @@ class ResourceBoundTests(unittest.TestCase):
             self.assertEqual(service.snapshot("http://localhost", "model"), service.snapshot("http://localhost", "model"))
         ollama.assert_called_once()
         scheduler.assert_called_once()
+
+
+class RestartRecoveryTests(unittest.TestCase):
+    @staticmethod
+    def _stored_record(status: str = "running") -> dict[str, object]:
+        return {
+            "id": "resume-job-1",
+            "kind": "dorama",
+            "title": "Восстановление",
+            "status": status,
+            "progress": 52,
+            "message": "Старый процесс",
+            "logs": ["этап сохранён"],
+            "created_at": "2026-08-20T10:00:00+03:00",
+            "finished_at": None,
+            "result": None,
+            "resume_count": 0,
+        }
+
+    def test_interrupted_resumable_job_is_enqueued_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = JobStore(Path(temporary) / "jobs.db")
+            store.initialize()
+            store.save(
+                self._stored_record(),
+                {"query": "дорама", "limit": 10},
+                resumable=True,
+            )
+            called = Event()
+
+            def handler(job_id: str, kind: str, payload: dict[str, object]) -> str:
+                self.assertEqual("resume-job-1", job_id)
+                self.assertEqual("dorama", kind)
+                self.assertEqual("дорама", payload["query"])
+                called.set()
+                return "готово"
+
+            manager = JobManager(
+                store=store,
+                persistent_handler=handler,
+            )
+            self.assertEqual(1, manager.start())
+            self.assertTrue(called.wait(2))
+            for _ in range(40):
+                job = manager.recent(1)[0]
+                if job["status"] == "succeeded":
+                    break
+                time.sleep(0.025)
+            self.assertEqual("succeeded", job["status"])
+            self.assertEqual(1, job["resume_count"])
+            manager.shutdown()
+
+    def test_recovery_loads_all_active_jobs_beyond_history_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = JobStore(Path(temporary) / "jobs.db")
+            store.initialize()
+            for index in range(4):
+                record = self._stored_record(
+                    status="running" if index < 3 else "succeeded"
+                )
+                record["id"] = f"job-{index}"
+                store.save(record, {"index": index}, resumable=True)
+            loaded = store.load_for_recovery(history_limit=1)
+            active = [
+                item
+                for item in loaded
+                if item.record["status"] == "running"
+            ]
+            self.assertEqual(3, len(active))
+            self.assertEqual(4, len(loaded))
+
+    def test_external_publication_is_not_replayed_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = JobStore(Path(temporary) / "jobs.db")
+            store.initialize()
+            record = self._stored_record()
+            record["kind"] = "youtube"
+            store.save(
+                record,
+                {"clip_id": 7, "privacy": "private"},
+                resumable=False,
+            )
+            called = Event()
+            manager = JobManager(
+                store=store,
+                persistent_handler=lambda *_args: called.set(),
+            )
+            self.assertEqual(0, manager.start())
+            job = manager.recent(1)[0]
+            self.assertEqual("attention", job["status"])
+            self.assertFalse(called.is_set())
+            manager.shutdown()
+
+    def test_queued_publication_can_resume_if_it_never_started(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = JobStore(Path(temporary) / "jobs.db")
+            store.initialize()
+            record = self._stored_record(status="queued")
+            record["kind"] = "youtube"
+            store.save(record, {"clip_id": 7}, resumable=False)
+            called = Event()
+            manager = JobManager(
+                store=store,
+                persistent_handler=lambda *_args: called.set(),
+            )
+            self.assertEqual(1, manager.start())
+            self.assertTrue(called.wait(2))
+            manager.shutdown()
+
+    def test_graceful_shutdown_marks_running_job_paused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = JobStore(Path(temporary) / "jobs.db")
+            started = Event()
+
+            def handler(_job_id: str, _kind: str, _payload: dict[str, object]) -> None:
+                started.set()
+                while True:
+                    cancellable_wait(0.05)
+
+            manager = JobManager(
+                store=store,
+                persistent_handler=handler,
+            )
+            manager.start()
+            manager.submit_persistent(
+                "dorama",
+                "Долгая задача",
+                {"query": "дорама"},
+            )
+            self.assertTrue(started.wait(2))
+            manager.shutdown()
+            for _ in range(40):
+                stored = store.load_recent(1)[0]
+                if stored.record["status"] == "paused":
+                    break
+                time.sleep(0.025)
+            self.assertEqual("paused", stored.record["status"])
 
 
 if __name__ == "__main__":
