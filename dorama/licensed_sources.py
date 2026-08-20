@@ -1,23 +1,32 @@
 """Поиск и загрузка только источников с проверяемым разрешением на переработку."""
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
-from pathlib import Path
 import json
 import math
 import re
 import subprocess
-import sys
-from urllib.parse import quote, urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from time import monotonic
+from typing import Any
+from urllib.parse import quote, urljoin, urlparse
 
-import imageio_ffmpeg
+import imageio_ffmpeg  # type: ignore[import-untyped]
 import requests
 
 from dorama.discover import USER_AGENT, clean_text, parse_duration, query_variants
 from dorama.source_pipeline import create_episode_recap
-from job_control import JobCancelled, checkpoint, run_process
-from settings import CONFIG, INPUT_DIR
+from job_control import (
+    JobCancelled,
+    cancellable_wait,
+    checkpoint,
+    run_process,
+    submit_cancellable,
+)
+from runtime_support import python_module_command
+from settings import CONFIG, INPUT_DIR, PENDING_DIR
+from storage.files import atomic_write_text
 
 
 @dataclass(frozen=True)
@@ -38,11 +47,11 @@ class LicensedCandidate:
 
 
 def _run_yt_dlp(arguments: list[str], timeout: int = 180) -> str:
-    command = [sys.executable, "-m", "yt_dlp", *arguments]
+    command = python_module_command("yt_dlp", *arguments)
     result = run_process(command, capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:
         raise RuntimeError(result.stderr[-2000:] or "yt-dlp завершился с ошибкой")
-    return result.stdout.strip()
+    return str(result.stdout).strip()
 
 
 def _open_license_basis(license_name: str, license_url: str = "") -> str | None:
@@ -59,7 +68,7 @@ def _open_license_basis(license_name: str, license_url: str = "") -> str | None:
     return None
 
 
-def _permission_basis(metadata: dict) -> str | None:
+def _permission_basis(metadata: dict[str, Any]) -> str | None:
     cfg = CONFIG["licensed_sources"]
     license_name = str(metadata.get("license") or "").strip()
     if "creative commons" in license_name.lower() and "reuse allowed" in license_name.lower():
@@ -72,7 +81,7 @@ def _permission_basis(metadata: dict) -> str | None:
     return None
 
 
-def _candidate_from_metadata(metadata: dict) -> LicensedCandidate | None:
+def _candidate_from_metadata(metadata: dict[str, Any]) -> LicensedCandidate | None:
     basis = _permission_basis(metadata)
     if not basis or metadata.get("availability") not in {None, "public"}:
         return None
@@ -133,8 +142,8 @@ def _quota(limit: int, variants: list[str]) -> int:
     return max(3, math.ceil(limit / max(len(variants), 1)))
 
 
-def _search_entries(query: str, limit: int) -> list[dict]:
-    entries: list[dict] = []
+def _search_entries(query: str, limit: int) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
     variants = query_variants(query)
     for variant in variants:
         checkpoint()
@@ -146,7 +155,7 @@ def _search_entries(query: str, limit: int) -> list[dict]:
         except (RuntimeError, json.JSONDecodeError):
             continue
         entries.extend(item for item in payload.get("entries") or [] if isinstance(item, dict))
-    unique: dict[str, dict] = {}
+    unique: dict[str, dict[str, Any]] = {}
     for item in entries:
         key = str(item.get("id") or item.get("url") or "")
         if key:
@@ -154,17 +163,17 @@ def _search_entries(query: str, limit: int) -> list[dict]:
     return list(unique.values())[:limit]
 
 
-def _youtube_url(entry: dict) -> str:
+def _youtube_url(entry: dict[str, Any]) -> str:
     url = str(entry.get("url") or "")
     if not url.startswith("http") and entry.get("id"):
         url = f"https://www.youtube.com/watch?v={entry['id']}"
     return url
 
 
-def inspect_search_results(query: str, limit: int | None = None) -> list[dict]:
+def inspect_search_results(query: str, limit: int | None = None) -> list[dict[str, Any]]:
     """Вернуть результаты YouTube и статус разрешения; ничего не скачивать."""
     limit = limit or int(CONFIG["licensed_sources"]["youtube_search_results"])
-    results: list[dict] = []
+    results: list[dict[str, Any]] = []
     for entry in _search_entries(query, limit):
         url = _youtube_url(entry)
         if not url:
@@ -192,7 +201,7 @@ def inspect_search_results(query: str, limit: int | None = None) -> list[dict]:
 def _youtube_candidates(query: str, limit: int) -> list[LicensedCandidate]:
     entries = _search_entries(query, limit)
 
-    def inspect(entry: dict) -> LicensedCandidate | None:
+    def inspect(entry: dict[str, Any]) -> LicensedCandidate | None:
         url = _youtube_url(entry)
         if not url:
             return None
@@ -200,8 +209,9 @@ def _youtube_candidates(query: str, limit: int) -> list[LicensedCandidate]:
         return _candidate_from_metadata(metadata)
 
     candidates: list[LicensedCandidate] = []
-    with ThreadPoolExecutor(max_workers=min(4, max(len(entries), 1))) as pool:
-        futures = [pool.submit(inspect, entry) for entry in entries]
+    pool = ThreadPoolExecutor(max_workers=min(4, max(len(entries), 1)))
+    futures = [submit_cancellable(pool, inspect, entry) for entry in entries]
+    try:
         for future in as_completed(futures):
             checkpoint()
             try:
@@ -210,10 +220,14 @@ def _youtube_candidates(query: str, limit: int) -> list[LicensedCandidate]:
                 continue
             if candidate and _relevance_score(candidate, query) > 0:
                 candidates.append(candidate)
+    finally:
+        for future in futures:
+            future.cancel()
+        pool.shutdown(wait=False, cancel_futures=True)
     return candidates
 
 
-def _meta_value(metadata: dict, key: str) -> str:
+def _meta_value(metadata: dict[str, Any], key: str) -> str:
     value = metadata.get(key) or {}
     return clean_text(value.get("value") if isinstance(value, dict) else value)
 
@@ -225,14 +239,15 @@ def _commons_candidates(query: str, limit: int) -> list[LicensedCandidate]:
     max_bytes = int(CONFIG["licensed_sources"].get("max_download_mb", 2200)) * 1024 * 1024
     for variant in variants:
         checkpoint()
+        params: dict[str, str | int] = {
+            "action": "query", "generator": "search", "gsrsearch": f"{variant} filetype:video",
+            "gsrnamespace": 6, "gsrlimit": min(max(5, _quota(limit, variants)), 50),
+            "prop": "imageinfo", "iiprop": "url|size|mime|extmetadata",
+            "format": "json", "formatversion": 2,
+        }
         response = requests.get(
             "https://commons.wikimedia.org/w/api.php",
-            params={
-                "action": "query", "generator": "search", "gsrsearch": f"{variant} filetype:video",
-                "gsrnamespace": 6, "gsrlimit": min(max(5, _quota(limit, variants)), 50),
-                "prop": "imageinfo", "iiprop": "url|size|mime|extmetadata",
-                "format": "json", "formatversion": 2,
-            },
+            params=params,
             headers={"User-Agent": USER_AGENT}, timeout=30,
         )
         response.raise_for_status()
@@ -274,7 +289,7 @@ def _first(value: object) -> object:
     return value[0] if isinstance(value, list) and value else value
 
 
-def _archive_download(metadata: dict, max_bytes: int) -> tuple[str, int]:
+def _archive_download(metadata: dict[str, Any], max_bytes: int) -> tuple[str, int]:
     choices: list[tuple[int, int, str]] = []
     priority = {".mp4": 3, ".webm": 2, ".mkv": 1, ".mov": 1, ".m4v": 1}
     for item in metadata.get("files") or []:
@@ -293,7 +308,10 @@ def _archive_download(metadata: dict, max_bytes: int) -> tuple[str, int]:
         return "", 0
     _, size, name = max(choices, key=lambda item: (item[0], item[1]))
     identifier = str((metadata.get("metadata") or {}).get("identifier") or "")
-    return f"https://archive.org/download/{quote(identifier)}/{quote(name)}", size
+    return (
+        f"https://archive.org/download/{quote(identifier, safe='')}/{quote(name, safe='')}",
+        size,
+    )
 
 
 def _archive_candidates(query: str, limit: int) -> list[LicensedCandidate]:
@@ -360,11 +378,17 @@ def find_licensed_candidate(query: str, limit: int | None = None) -> LicensedCan
     limit = limit or int(CONFIG["licensed_sources"]["youtube_search_results"])
     enabled = CONFIG["licensed_sources"].get("search_sources") or list(LICENSED_PROVIDERS)
     providers = [(name, LICENSED_PROVIDERS[name]) for name in enabled if name in LICENSED_PROVIDERS]
+    if not providers:
+        raise RuntimeError("Не выбран ни один поддерживаемый лицензированный источник")
     print(f"[1/7] Ищу разрешённые видеоматериалы в {len(providers)} источниках: {query}")
     candidates: list[LicensedCandidate] = []
     errors: list[str] = []
-    with ThreadPoolExecutor(max_workers=min(len(providers), 3)) as pool:
-        futures = {pool.submit(provider, query, limit): name for name, provider in providers}
+    pool = ThreadPoolExecutor(max_workers=min(len(providers), 3))
+    futures = {
+        submit_cancellable(pool, provider, query, limit): name
+        for name, provider in providers
+    }
+    try:
         for future in as_completed(futures):
             checkpoint()
             name = futures[future]
@@ -372,8 +396,12 @@ def find_licensed_candidate(query: str, limit: int | None = None) -> LicensedCan
                 found = future.result()
                 candidates.extend(found)
                 print(f"  + {name}: разрешённых и релевантных — {len(found)}")
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — один провайдер не останавливает остальные
                 errors.append(f"{name}: {type(exc).__name__}")
+    finally:
+        for future in futures:
+            future.cancel()
+        pool.shutdown(wait=False, cancel_futures=True)
     for error in errors:
         print(f"  ! {error}")
     if not candidates:
@@ -389,21 +417,139 @@ def _safe_video_id(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", value)[:120] or "licensed-source"
 
 
+def _cached_download(
+    candidate: LicensedCandidate,
+    destination_dir: Path,
+    metadata_path: Path,
+) -> Path | None:
+    if not metadata_path.is_file():
+        return None
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    if (
+        str(metadata.get("video_id") or "") != candidate.video_id
+        or str(metadata.get("permission_basis") or "") != candidate.permission_basis
+    ):
+        return None
+    prefix = _safe_video_id(candidate.video_id)
+    matches = [
+        path for path in destination_dir.glob(f"{prefix}.*")
+        if path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".ogv"}
+        and path.is_file()
+        and path.stat().st_size > 0
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda path: path.stat().st_mtime)
+
+
+def _write_license_metadata(path: Path, candidate: LicensedCandidate) -> None:
+    atomic_write_text(path, json.dumps(asdict(candidate), ensure_ascii=False, indent=2))
+
+
+def _validate_download_url(url: str, source: str) -> str:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    allowed = {
+        "YouTube": host in {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"},
+        "Wikimedia Commons": host == "upload.wikimedia.org",
+        "Internet Archive": host == "archive.org" or host.endswith(".archive.org"),
+    }.get(source, False)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError(f"Источник вернул некорректный URL загрузки для {source}") from exc
+    if parsed.scheme != "https" or parsed.username or parsed.password or port not in {None, 443}:
+        allowed = False
+    if not allowed:
+        raise RuntimeError(f"Источник вернул недоверенный URL загрузки для {source}")
+    return url
+
+
+def _open_direct_download(url: str, source: str, headers: dict[str, str]) -> requests.Response:
+    current = _validate_download_url(url, source)
+    for _ in range(5):
+        response = requests.get(
+            current,
+            headers=headers,
+            stream=True,
+            timeout=(30, 180),
+            allow_redirects=False,
+        )
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            return response
+        location = response.headers.get("Location")
+        response.close()
+        if not location:
+            raise RuntimeError("Источник вернул перенаправление без Location")
+        current = _validate_download_url(urljoin(current, location), source)
+    raise RuntimeError("Источник вернул слишком много перенаправлений")
+
+
+def _looks_like_downloaded_video(path: Path) -> bool:
+    with path.open("rb") as source:
+        header = source.read(16)
+    return (
+        (len(header) >= 12 and header[4:8] == b"ftyp")
+        or header.startswith((b"\x1aE\xdf\xa3", b"OggS"))
+        or (header.startswith(b"RIFF") and header[8:12] == b"AVI ")
+    )
+
+
 def _download_direct(candidate: LicensedCandidate, destination_dir: Path) -> Path:
+    _validate_download_url(candidate.download_url, candidate.source)
     suffix = Path(urlparse(candidate.download_url).path).suffix.lower()
     if suffix not in {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".ogv"}:
         suffix = ".mp4"
     path = destination_dir / f"{_safe_video_id(candidate.video_id)}{suffix}"
+    partial_path = path.with_suffix(f"{path.suffix}.part")
     max_bytes = int(CONFIG["licensed_sources"].get("max_download_mb", 2200)) * 1024 * 1024
-    try:
-        with requests.get(candidate.download_url, headers={"User-Agent": USER_AGENT}, stream=True, timeout=(30, 180)) as response:
+    resume_at = partial_path.stat().st_size if partial_path.is_file() else 0
+    if resume_at > max_bytes:
+        partial_path.unlink(missing_ok=True)
+        resume_at = 0
+    if candidate.size_bytes and resume_at == candidate.size_bytes:
+        if not _looks_like_downloaded_video(partial_path):
+            partial_path.unlink(missing_ok=True)
+            raise RuntimeError("Сохранённая частичная загрузка не является видео")
+        partial_path.replace(path)
+        return path
+
+    headers = {"User-Agent": USER_AGENT}
+    if resume_at:
+        headers["Range"] = f"bytes={resume_at}-"
+        print(f"  Продолжаю загрузку с {resume_at / 1024 / 1024:.1f} МБ")
+    for attempt in range(4):
+        checkpoint()
+        with _open_direct_download(candidate.download_url, candidate.source, headers) as response:
+            if response.status_code == 429:
+                if attempt == 3:
+                    response.raise_for_status()
+                wait = min(30, 5 * (2 ** attempt))
+                print(f"  Rate limit (429), повтор через {wait}с…")
+                response.close()
+                cancellable_wait(wait)
+                continue
+            if response.status_code == 416 and candidate.size_bytes and resume_at >= candidate.size_bytes:
+                if not _looks_like_downloaded_video(partial_path):
+                    partial_path.unlink(missing_ok=True)
+                    raise RuntimeError("Сохранённая частичная загрузка не является видео")
+                partial_path.replace(path)
+                return path
             response.raise_for_status()
-            expected = int(response.headers.get("Content-Length") or 0)
-            if expected and expected > max_bytes:
+            append = resume_at > 0 and response.status_code == 206
+            written = resume_at if append else 0
+            expected_remaining = int(response.headers.get("Content-Length") or 0)
+            expected_total = written + expected_remaining if expected_remaining else candidate.size_bytes
+            if expected_total and expected_total > max_bytes:
                 raise RuntimeError("Разрешённый файл слишком большой для автоматической загрузки")
-            written = 0
-            with path.open("wb") as output:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
+            mode = "ab" if append else "wb"
+            started = monotonic()
+            last_reported = -1
+            with partial_path.open(mode) as output:
+                for chunk in response.iter_content(chunk_size=4 * 1024 * 1024):
                     checkpoint()
                     if not chunk:
                         continue
@@ -411,30 +557,47 @@ def _download_direct(candidate: LicensedCandidate, destination_dir: Path) -> Pat
                     if written > max_bytes:
                         raise RuntimeError("Загрузка остановлена: превышен лимит размера файла")
                     output.write(chunk)
+                    if expected_total:
+                        percent = min(100, int(written * 100 / expected_total))
+                        bucket = percent // 10
+                        if bucket > last_reported:
+                            elapsed = max(monotonic() - started, 0.001)
+                            speed = max(written - (resume_at if append else 0), 0) / elapsed / 1024 / 1024
+                            print(f"  Загрузка: {percent}% · {written / 1024 / 1024:.0f} МБ · {speed:.1f} МБ/с")
+                            last_reported = bucket
             checkpoint()
-    except JobCancelled:
-        path.unlink(missing_ok=True)
-        raise
-    return path
+            if not _looks_like_downloaded_video(partial_path):
+                partial_path.unlink(missing_ok=True)
+                raise RuntimeError("Источник вернул не видео, несмотря на расширение файла")
+            partial_path.replace(path)
+            return path
+    raise RuntimeError("Источник не отдал файл после повторных попыток")
 
 
 def download_candidate(candidate: LicensedCandidate) -> tuple[Path, Path]:
     print(f"[2/7] Скачиваю разрешённый источник ({candidate.source}): {candidate.title}")
     destination_dir = INPUT_DIR / "licensed"
     destination_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = destination_dir / f"{_safe_video_id(candidate.video_id)}.license.json"
+    cached = _cached_download(candidate, destination_dir, metadata_path)
+    if cached is not None:
+        print(f"  Download cache: использую {cached.name}")
+        return cached, metadata_path
     if candidate.source == "YouTube":
+        _validate_download_url(candidate.download_url or candidate.url, candidate.source)
         output_template = destination_dir / f"{_safe_video_id(candidate.video_id)}.%(ext)s"
         height = int(CONFIG["licensed_sources"].get("download_height", 1080))
         ffmpeg_dir = str(Path(imageio_ffmpeg.get_ffmpeg_exe()).parent)
         try:
             _run_yt_dlp([
                 "--no-playlist", "--ffmpeg-location", ffmpeg_dir,
+                "--continue", "--part", "--no-overwrites",
+                "--concurrent-fragments", "4", "--retries", "10", "--fragment-retries", "10",
                 "-f", f"bestvideo[height<={height}]+bestaudio/best[height<={height}]",
                 "--merge-output-format", "mp4", "-o", str(output_template), candidate.download_url or candidate.url,
             ], timeout=1800)
         except JobCancelled:
-            for partial in destination_dir.glob(f"{_safe_video_id(candidate.video_id)}.*"):
-                partial.unlink(missing_ok=True)
+            print("  Частичная загрузка сохранена и продолжится при повторном запуске")
             raise
         matches = [
             path for path in destination_dir.glob(f"{_safe_video_id(candidate.video_id)}.*")
@@ -445,19 +608,61 @@ def download_candidate(candidate: LicensedCandidate) -> tuple[Path, Path]:
         video_path = max(matches, key=lambda path: path.stat().st_mtime)
     else:
         video_path = _download_direct(candidate, destination_dir)
-    metadata_path = destination_dir / f"{_safe_video_id(candidate.video_id)}.license.json"
-    metadata_path.write_text(json.dumps(asdict(candidate), ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_license_metadata(metadata_path, candidate)
     return video_path, metadata_path
 
 
-def create_licensed_dorama_video(query: str, focus: str = "", limit: int | None = None) -> Path:
-    candidate = find_licensed_candidate(query, limit)
-    video_path, metadata_path = download_candidate(candidate)
+def create_licensed_dorama_video(
+    query: str,
+    focus: str = "",
+    limit: int | None = None,
+    operation_id: str | None = None,
+) -> Path:
+    checkpoint_path = (
+        PENDING_DIR / ".work" / f"{operation_id}.licensed-source.json"
+        if operation_id
+        else None
+    )
+    restored: tuple[LicensedCandidate, Path, Path] | None = None
+    if checkpoint_path and checkpoint_path.is_file():
+        try:
+            saved = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            candidate = LicensedCandidate(**saved["candidate"])
+            video_path = Path(str(saved["video_path"]))
+            metadata_path = Path(str(saved["metadata_path"]))
+            if video_path.is_file() and metadata_path.is_file():
+                restored = candidate, video_path, metadata_path
+        except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+            checkpoint_path.unlink(missing_ok=True)
+    if restored is None:
+        candidate = find_licensed_candidate(query, limit)
+        video_path, metadata_path = download_candidate(candidate)
+        if checkpoint_path:
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(
+                checkpoint_path,
+                json.dumps(
+                    {
+                        "candidate": asdict(candidate),
+                        "video_path": str(video_path),
+                        "metadata_path": str(metadata_path),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+    else:
+        candidate, video_path, metadata_path = restored
+        print(f"[1/7] ↻ Восстановлен источник: {candidate.title}")
     print(f"  Лицензия сохранена: {metadata_path.name}")
     print("[3/7] Передаю материал в пятиминутный монтаж...")
-    return create_episode_recap(
+    result = create_episode_recap(
         video_path,
         focus=focus or f"объяснить, почему материал связан с темой «{query}», без выдумывания фактов",
         source_info=asdict(candidate),
         progress_offset=2,
+        operation_id=operation_id,
     )
+    if checkpoint_path:
+        checkpoint_path.unlink(missing_ok=True)
+    return result

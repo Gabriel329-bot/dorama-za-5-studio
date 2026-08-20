@@ -1,21 +1,20 @@
 """Мультиплатформенный поиск открытых метаданных без скачивания чужого видео."""
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
-from html import unescape
 import json
 import math
 import re
-import subprocess
-import sys
-from typing import Callable
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
+from html import unescape
+from typing import Any
 
 import requests
 
-from job_control import checkpoint, run_process
+from job_control import checkpoint, run_process, submit_cancellable
+from runtime_support import python_module_command
 from settings import CONFIG
-
 
 USER_AGENT = "DoramaRadar/2.0 (+local metadata search)"
 
@@ -108,7 +107,7 @@ def is_relevant(text: str, query: str) -> bool:
     return matched >= min(2, len(concepts))
 
 
-def _parse_search(payload: dict, source: str = "YouTube") -> list[Trend]:
+def _parse_search(payload: dict[str, Any], source: str = "YouTube") -> list[Trend]:
     trends: list[Trend] = []
     for item in payload.get("entries") or []:
         if not isinstance(item, dict) or not item.get("title"):
@@ -142,14 +141,12 @@ def search_youtube(query: str, limit: int = 10) -> list[Trend]:
     variants = query_variants(query)
     for variant in variants:
         checkpoint()
-        command = [
-            sys.executable,
-            "-m",
+        command = python_module_command(
             "yt_dlp",
             "--flat-playlist",
             "--dump-single-json",
             f"ytsearch{_quota(limit, variants)}:{variant}",
-        ]
+        )
         result = run_process(command, capture_output=True, text=True, timeout=90)
         if result.returncode != 0:
             continue
@@ -160,7 +157,7 @@ def search_youtube(query: str, limit: int = 10) -> list[Trend]:
     return _deduplicate(items, limit)
 
 
-def _bilibili_video_rows(payload: dict) -> list[dict]:
+def _bilibili_video_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     for group in (payload.get("data") or {}).get("result") or []:
         if group.get("result_type") == "video":
             return [item for item in group.get("data") or [] if isinstance(item, dict)]
@@ -168,42 +165,44 @@ def _bilibili_video_rows(payload: dict) -> list[dict]:
 
 
 def search_bilibili(query: str, limit: int = 10) -> list[Trend]:
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
-        "Referer": "https://www.bilibili.com/",
-    })
-    session.get("https://www.bilibili.com/", timeout=12)
     items: list[Trend] = []
     variants = query_variants(query)
-    for variant in variants:
-        checkpoint()
-        response = session.get(
-            "https://api.bilibili.com/x/web-interface/search/all/v2",
-            params={"keyword": variant, "page": 1},
-            timeout=20,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("code") != 0:
-            continue
-        for row in _bilibili_video_rows(payload)[:_quota(limit, variants)]:
-            bvid = str(row.get("bvid") or "")
-            if not bvid:
+    with requests.Session() as session:
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+            "Referer": "https://www.bilibili.com/",
+        })
+        session.get("https://www.bilibili.com/", timeout=12)
+        for variant in variants:
+            checkpoint()
+            params: dict[str, str | int] = {"keyword": variant, "page": 1}
+            response = session.get(
+                "https://api.bilibili.com/x/web-interface/search/all/v2",
+                params=params,
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("code") != 0:
                 continue
-            title = clean_text(row.get("title"))
-            description = clean_text(row.get("description"))[:600]
-            if not is_relevant(f"{title} {description}", query):
-                continue
-            items.append(Trend(
-                title=title,
-                channel=clean_text(row.get("author") or "неизвестный автор"),
-                url=f"https://www.bilibili.com/video/{bvid}",
-                views=int(row.get("play") or 0),
-                duration=parse_duration(row.get("duration")),
-                source="Bilibili",
-                description=description,
-            ))
+            for row in _bilibili_video_rows(payload)[:_quota(limit, variants)]:
+                bvid = str(row.get("bvid") or "")
+                if not bvid:
+                    continue
+                title = clean_text(row.get("title"))
+                description = clean_text(row.get("description"))[:600]
+                if not is_relevant(f"{title} {description}", query):
+                    continue
+                items.append(Trend(
+                    title=title,
+                    channel=clean_text(row.get("author") or "неизвестный автор"),
+                    url=f"https://www.bilibili.com/video/{bvid}",
+                    views=int(row.get("play") or 0),
+                    duration=parse_duration(row.get("duration")),
+                    source="Bilibili",
+                    description=description,
+                ))
     return _deduplicate(items, limit)
 
 
@@ -212,13 +211,14 @@ def search_dailymotion(query: str, limit: int = 10) -> list[Trend]:
     variants = query_variants(query)
     for variant in variants:
         checkpoint()
+        params: dict[str, str | int] = {
+            "search": variant,
+            "fields": "id,title,description,owner.screenname,url,views_total,duration",
+            "limit": min(_quota(limit, variants), 100),
+        }
         response = requests.get(
             "https://api.dailymotion.com/videos",
-            params={
-                "search": variant,
-                "fields": "id,title,description,owner.screenname,url,views_total,duration",
-                "limit": min(_quota(limit, variants), 100),
-            },
+            params=params,
             headers={"User-Agent": USER_AGENT},
             timeout=20,
         )
@@ -281,7 +281,7 @@ def search_internet_archive(query: str, limit: int = 10) -> list[Trend]:
     return _deduplicate(items, limit)
 
 
-def _metadata_value(metadata: dict, name: str) -> str:
+def _metadata_value(metadata: dict[str, Any], name: str) -> str:
     value = metadata.get(name) or {}
     return clean_text(value.get("value") if isinstance(value, dict) else value)
 
@@ -291,15 +291,16 @@ def search_wikimedia_commons(query: str, limit: int = 10) -> list[Trend]:
     variants = query_variants(query)
     for variant in variants:
         checkpoint()
+        params: dict[str, str | int] = {
+            "action": "query", "generator": "search",
+            "gsrsearch": f"{variant} filetype:video", "gsrnamespace": 6,
+            "gsrlimit": min(_quota(limit, variants), 50),
+            "prop": "imageinfo", "iiprop": "url|size|mime|extmetadata",
+            "format": "json", "formatversion": 2,
+        }
         response = requests.get(
             "https://commons.wikimedia.org/w/api.php",
-            params={
-                "action": "query", "generator": "search",
-                "gsrsearch": f"{variant} filetype:video", "gsrnamespace": 6,
-                "gsrlimit": min(_quota(limit, variants), 50),
-                "prop": "imageinfo", "iiprop": "url|size|mime|extmetadata",
-                "format": "json", "formatversion": 2,
-            },
+            params=params,
             headers={"User-Agent": USER_AGENT},
             timeout=25,
         )
@@ -346,10 +347,16 @@ def search_all_sources(query: str, limit_per_source: int = 10) -> list[Trend]:
     """Искать параллельно; ошибка одной площадки не обрывает остальные."""
     enabled = CONFIG.get("dorama", {}).get("search_sources") or list(SEARCH_PROVIDERS)
     providers = [(name, SEARCH_PROVIDERS[name]) for name in enabled if name in SEARCH_PROVIDERS]
+    if not providers:
+        raise RuntimeError("Не выбран ни один поддерживаемый источник поиска")
     buckets: dict[str, list[Trend]] = {}
     errors: list[str] = []
-    with ThreadPoolExecutor(max_workers=min(len(providers), 5)) as pool:
-        futures = {pool.submit(provider, query, limit_per_source): name for name, provider in providers}
+    pool = ThreadPoolExecutor(max_workers=min(len(providers), 5))
+    futures = {
+        submit_cancellable(pool, provider, query, limit_per_source): name
+        for name, provider in providers
+    }
+    try:
         for future in as_completed(futures):
             checkpoint()
             name = futures[future]
@@ -360,8 +367,12 @@ def search_all_sources(query: str, limit_per_source: int = 10) -> list[Trend]:
                     print(f"  + {results[0].source}: {len(results)} сигналов")
                 else:
                     errors.append(f"{name}: результатов нет")
-            except Exception as exc:  # отдельный источник не должен останавливать весь поиск
+            except Exception as exc:  # noqa: BLE001 — один источник не останавливает поиск
                 errors.append(f"{name}: {type(exc).__name__}")
+    finally:
+        for future in futures:
+            future.cancel()
+        pool.shutdown(wait=False, cancel_futures=True)
     for error in errors:
         print(f"  ! {error}")
     # Round-robin сохраняет разнообразие: один популярный сайт не вытесняет остальные.
@@ -382,5 +393,5 @@ def search_all_sources(query: str, limit_per_source: int = 10) -> list[Trend]:
     return unique
 
 
-def trends_as_dicts(items: list[Trend]) -> list[dict]:
+def trends_as_dicts(items: list[Trend]) -> list[dict[str, Any]]:
     return [asdict(item) for item in items]

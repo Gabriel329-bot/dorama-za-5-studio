@@ -3,9 +3,11 @@ import argparse
 import json
 from pathlib import Path
 
-import torch
-import torchaudio
-from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+import torch  # type: ignore[import-not-found]
+import torchaudio  # type: ignore[import-not-found]
+from chatterbox.mtl_tts import (  # type: ignore[import-not-found]
+    ChatterboxMultilingualTTS,
+)
 
 
 def main() -> None:

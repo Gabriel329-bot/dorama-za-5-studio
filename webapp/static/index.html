@@ -10,8 +10,8 @@
     />
     <title>Дорама за 5 — Studio</title>
     <link rel="icon" href="/brand/avatar-dorama-za-5.png" />
-    <link rel="stylesheet" href="/styles.css" />
-    <script src="/app.js" defer></script>
+    <link rel="stylesheet" href="/styles.css?v=5" />
+    <script src="/app.js?v=5" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one"></div>
@@ -33,6 +33,7 @@
       <div class="top-actions">
         <div class="live-pill"><span></span><b id="systemLabel">Проверяю систему</b></div>
         <button class="icon-button" id="refreshButton" type="button" aria-label="Обновить данные">↻</button>
+        <button class="icon-button" id="openSettingsButton" type="button" aria-label="Настройки пайплайна">⚙</button>
       </div>
     </header>
 
@@ -187,11 +188,22 @@
                 <b id="uploadTitle">Перетащите серию или трейлер</b>
                 <small id="uploadHint">ваш файл с правом использования · MP4, MOV, MKV, WEBM</small>
               </label>
+              <fieldset class="source-mode translation-mode">
+                <legend>Режим обработки</legend>
+                <label>
+                  <input type="radio" name="episodeMode" value="recap" checked />
+                  <span><b>Пересказ 5 минут</b><small>ключевые сцены и сюжетный сторителлинг</small></span>
+                </label>
+                <label>
+                  <input type="radio" name="episodeMode" value="translate" />
+                  <span><b>Перевод без пересказа</b><small>точный выбранный фрагмент по порядку</small></span>
+                </label>
+              </fieldset>
               <label class="focus-field">
-                <span>Фокус пересказа</span>
+                <span id="episodeFocusLabel">Фокус пересказа</span>
                 <input id="episodeFocus" type="text" maxlength="300" placeholder="Например: интрига без раскрытия финала" />
               </label>
-              <ul class="feature-list">
+              <ul class="feature-list" id="episodeFeatures">
                 <li><span>01</span><div><b>Сюжетный таймлайн</b><small>распознаёт речь на любом языке</small></div></li>
                 <li><span>02</span><div><b>Ключевые сцены</b><small>монтаж ровно на пять минут</small></div></li>
                 <li><span>03</span><div><b>Русский сторителлинг</b><small>озвучка, QA и субтитры</small></div></li>
@@ -201,7 +213,7 @@
                 <span>Подтверждаю, что у меня есть права на использование этого видео</span>
               </label>
               <button class="button button-secondary full" id="clipButton" type="submit" disabled>
-                Сделать пересказ на 5 минут <span>→</span>
+                <span id="uploadButtonLabel">Сделать пересказ на 5 минут</span> <span>→</span>
               </button>
             </form>
           </article>
@@ -211,7 +223,10 @@
             <div id="jobsList" class="jobs-list">
               <div class="empty-state compact"><span>◎</span><p>Новых задач пока нет</p></div>
             </div>
-            <button class="text-button" id="doctorButton" type="button">Проверить все компоненты <span>↗</span></button>
+            <div class="process-actions">
+              <button class="text-button danger-text" id="clearJobsButton" type="button" disabled>Очистить список <span>×</span></button>
+              <button class="text-button" id="doctorButton" type="button">Проверить компоненты <span>↗</span></button>
+            </div>
           </aside>
         </div>
       </section>
@@ -244,7 +259,7 @@
           <article class="platform-card" id="youtubeCard">
             <div class="platform-icon youtube">▶</div>
             <div class="platform-main"><small>ПОДКЛЮЧЕНО</small><h3>YouTube</h3><p id="youtubeDetail">Проверяю OAuth…</p></div>
-            <div class="platform-actions"><span class="switch on" aria-label="YouTube включён"></span><button type="button" id="settingsButton">Настроить</button></div>
+            <div class="platform-actions"><span class="switch on" aria-label="YouTube включён"></span><button type="button" id="ytSettingsButton">Расписание</button></div>
           </article>
           <article class="platform-card dimmed">
             <div class="platform-icon tiktok">♪</div>
@@ -271,6 +286,19 @@
       <span id="lastUpdated">—</span>
     </footer>
 
+    <dialog id="ytScheduleDialog" class="modal">
+      <form method="dialog" class="modal-card" id="ytScheduleForm">
+        <button class="modal-close" type="button" data-close-dialog aria-label="Закрыть">×</button>
+        <span class="modal-kicker">YOUTUBE / РАСПИСАНИЕ</span>
+        <h2>Автопубликация</h2>
+        <label class="toggle-row"><span><b>Включить расписание</b><small>проверка каждые 15 минут</small></span><input id="scheduleEnabled" type="checkbox" /></label>
+        <label><span>Время публикации</span><input id="scheduleTimes" type="text" placeholder="12:00, 19:00" /></label>
+        <label><span>Доступ по умолчанию</span><select id="schedulePrivacy"><option value="private">Приватный — рекомендуется</option><option value="unlisted">По ссылке</option><option value="public">Публичный</option></select></label>
+        <p class="warning-note">Публичный режим будет автоматически отправлять одобренный ролик подписчикам. Используйте его только после проверки нескольких приватных загрузок.</p>
+        <div class="modal-actions"><button class="button button-ghost" type="button" data-close-dialog>Отмена</button><button class="button button-primary" type="submit">Сохранить</button></div>
+      </form>
+    </dialog>
+
     <dialog id="publishDialog" class="modal">
       <form method="dialog" class="modal-card" id="publishForm">
         <button class="modal-close" type="button" data-close-dialog aria-label="Закрыть">×</button>
@@ -286,16 +314,130 @@
       </form>
     </dialog>
 
-    <dialog id="settingsDialog" class="modal">
-      <form method="dialog" class="modal-card" id="settingsForm">
+    <dialog id="clearJobsDialog" class="modal">
+      <form class="modal-card" id="clearJobsForm">
         <button class="modal-close" type="button" data-close-dialog aria-label="Закрыть">×</button>
-        <span class="modal-kicker">YOUTUBE / РАСПИСАНИЕ</span>
-        <h2>Автопубликация</h2>
-        <label class="toggle-row"><span><b>Включить расписание</b><small>проверка каждые 15 минут</small></span><input id="scheduleEnabled" type="checkbox" /></label>
-        <label><span>Время публикации</span><input id="scheduleTimes" type="text" placeholder="12:00, 19:00" /></label>
-        <label><span>Доступ по умолчанию</span><select id="schedulePrivacy"><option value="private">Приватный — рекомендуется</option><option value="unlisted">По ссылке</option><option value="public">Публичный</option></select></label>
-        <p class="warning-note">Публичный режим будет автоматически отправлять одобренный ролик подписчикам. Используйте его только после проверки нескольких приватных загрузок.</p>
-        <div class="modal-actions"><button class="button button-ghost" type="button" data-close-dialog>Отмена</button><button class="button button-primary" id="saveSettings" type="submit">Сохранить</button></div>
+        <span class="modal-kicker">ПРОЦЕССЫ / ИСТОРИЯ</span>
+        <h2>Очистить список?</h2>
+        <p>Будут удалены только завершённые процессы, включая сохранённые сообщения об ошибках. Активные, ожидающие и приостановленные задачи останутся.</p>
+        <div class="modal-actions">
+          <button class="button button-ghost" type="button" data-close-dialog>Отмена</button>
+          <button class="button button-primary danger-button" type="submit">Удалить завершённые</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="settingsDialog" class="modal settings-modal">
+      <form method="dialog" class="modal-card settings-card" id="settingsForm">
+        <button class="modal-close" type="button" data-close-dialog aria-label="Закрыть">×</button>
+        <span class="modal-kicker">НАСТРОЙКИ / PIPELINE</span>
+        <h2>Настройки пайплайна</h2>
+
+        <div class="settings-tabs" role="tablist">
+          <button type="button" class="settings-tab active" data-settings-tab="whisper">Whisper</button>
+          <button type="button" class="settings-tab" data-settings-tab="ollama">Ollama</button>
+          <button type="button" class="settings-tab" data-settings-tab="voice">Голос</button>
+          <button type="button" class="settings-tab" data-settings-tab="pipeline">Пайплайн</button>
+        </div>
+
+        <div class="settings-section active" data-settings-section="whisper">
+          <label><span>Модель Whisper</span>
+            <select id="setWhisperModel">
+              <option value="tiny">tiny — быстро, низкая точность</option>
+              <option value="base">base — базовая</option>
+              <option value="small">small — хорошая</option>
+              <option value="medium" selected>medium — отличная (рекомендуется)</option>
+              <option value="large-v3">large-v3 — максимальная, много RAM</option>
+            </select>
+          </label>
+          <label><span>Устройство</span>
+            <select id="setWhisperDevice">
+              <option value="cuda">CUDA (NVIDIA GPU)</option>
+              <option value="cpu">CPU</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="settings-section" data-settings-section="ollama">
+          <label><span>Модель Ollama</span>
+            <select id="setOllamaModel">
+              <option value="qwen2.5:3b">qwen2.5:3b — мало RAM</option>
+              <option value="qwen2.5:7b" selected>qwen2.5:7b — рекомендуется</option>
+              <option value="qwen2.5:14b">qwen2.5:14b — подробнее, больше RAM</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="settings-section" data-settings-section="voice">
+          <label><span>Голос Edge TTS</span>
+            <select id="setVoice">
+              <option value="ru-RU-DmitryNeural" selected>Dmitry — мужской</option>
+              <option value="ru-RU-SvetlanaNeural">Svetlana — женский</option>
+            </select>
+          </label>
+          <label><span>Скорость речи</span>
+            <select id="setRate">
+              <option value="+0%">Нормальная</option>
+              <option value="+8%">Чуть быстрее</option>
+              <option value="+12%" selected>Быстрая (TikTok)</option>
+              <option value="+20%">Очень быстрая</option>
+            </select>
+          </label>
+          <label><span>Высота тона</span>
+            <select id="setPitch">
+              <option value="+0Hz">Нормальная</option>
+              <option value="-2Hz" selected>Чуть ниже</option>
+              <option value="-4Hz">Ниже</option>
+              <option value="+2Hz">Чуть выше</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="settings-section" data-settings-section="pipeline">
+          <label><span>Длительность ролика (сек)</span>
+            <select id="setDuration">
+              <option value="120">2 минуты</option>
+              <option value="180">3 минуты</option>
+              <option value="240">4 минуты</option>
+              <option value="300" selected>5 минут</option>
+              <option value="420">7 минут</option>
+              <option value="600">10 минут</option>
+            </select>
+          </label>
+          <label><span>Сцен в выпуске</span>
+            <select id="setSceneCount">
+              <option value="5">5 — компактно</option>
+              <option value="7">7</option>
+              <option value="9" selected>9 — стандарт</option>
+              <option value="12">12 — подробно</option>
+              <option value="16">16 — максимум</option>
+            </select>
+          </label>
+          <label><span>Громкость оригинала</span>
+            <input id="setVolume" type="range" min="0" max="1" step="0.02" value="0.16" />
+            <small id="setVolumeLabel">0.16</small>
+          </label>
+          <label><span>Целевое число слов</span>
+            <input id="setScriptWords" type="number" min="200" max="2000" step="10" value="680" />
+          </label>
+          <label><span>Источники поиска</span>
+            <div class="checkbox-group" id="setSourcesGroup">
+              <label class="checkbox-pill"><input type="checkbox" name="source" value="youtube" checked /><span>YouTube</span></label>
+              <label class="checkbox-pill"><input type="checkbox" name="source" value="bilibili" checked /><span>Bilibili</span></label>
+              <label class="checkbox-pill"><input type="checkbox" name="source" value="dailymotion" checked /><span>Dailymotion</span></label>
+              <label class="checkbox-pill"><input type="checkbox" name="source" value="internet_archive" checked /><span>Archive</span></label>
+              <label class="checkbox-pill"><input type="checkbox" name="source" value="wikimedia_commons" checked /><span>Wikimedia</span></label>
+            </div>
+          </label>
+          <label class="toggle-row"><span><b>Ручная проверка</b><small>только после подтверждения</small></span>
+            <input id="setRequireReview" type="checkbox" checked />
+          </label>
+        </div>
+
+        <div class="modal-actions">
+          <button class="button button-ghost" type="button" data-close-dialog>Отмена</button>
+          <button class="button button-primary" id="saveSettings" type="submit">Сохранить настройки</button>
+        </div>
       </form>
     </dialog>
 
@@ -306,6 +448,42 @@
         <h2 id="previewTitle">Выпуск</h2>
         <video id="previewVideo" controls preload="metadata"></video>
       </div>
+    </dialog>
+
+    <dialog id="translationEditorDialog" class="modal editor-modal">
+      <form class="modal-card editor-card" id="translationEditorForm">
+        <button class="modal-close" type="button" data-close-dialog aria-label="Закрыть">×</button>
+        <span class="modal-kicker">ПЕРЕВОД / ВЫБОР ФРАГМЕНТА</span>
+        <h2>Мини-монтажная</h2>
+        <p id="editorFilename">Выберите непрерывный фрагмент до пяти минут. Сцены сохранят исходный порядок.</p>
+
+        <div class="editor-workspace">
+          <video id="editorVideo" controls preload="metadata"></video>
+          <div class="editor-transport">
+            <button class="button button-ghost" id="setEditorStart" type="button">Начало по курсору</button>
+            <strong id="editorPlayhead">00:00</strong>
+            <button class="button button-ghost" id="setEditorEnd" type="button">Конец по курсору</button>
+          </div>
+          <div class="editor-timeline" id="editorTimeline">
+            <div class="editor-track"></div>
+            <div class="editor-selection" id="editorSelection"></div>
+            <input class="editor-range editor-range-start" id="editorStartRange" type="range" min="0" max="300" step="0.1" value="0" aria-label="Начало фрагмента" />
+            <input class="editor-range editor-range-end" id="editorEndRange" type="range" min="0" max="300" step="0.1" value="300" aria-label="Конец фрагмента" />
+          </div>
+          <div class="editor-time-grid"><span>00:00</span><span id="editorDurationLabel">05:00</span></div>
+          <div class="editor-time-fields">
+            <label><span>Начало, сек</span><input id="editorStart" type="number" min="0" step="0.1" value="0" /></label>
+            <div class="editor-selected-time"><small>Выбрано</small><strong id="editorSelectedDuration">05:00</strong><span>максимум 05:00</span></div>
+            <label><span>Конец, сек</span><input id="editorEnd" type="number" min="10" step="0.1" value="300" /></label>
+          </div>
+        </div>
+
+        <p class="editor-note">Будут переведены речь и субтитры только внутри выбранного интервала. Это закадровый перевод, не липсинк.</p>
+        <div class="modal-actions">
+          <button class="button button-ghost" type="button" data-close-dialog>Отмена</button>
+          <button class="button button-primary" id="startTranslationButton" type="submit">Перевести фрагмент</button>
+        </div>
+      </form>
     </dialog>
 
     <div class="toast-stack" id="toasts" aria-live="polite"></div>

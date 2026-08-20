@@ -1,6 +1,6 @@
 """Разовая проверка расписания. Вызывается по расписанию из Windows Task Scheduler
 (например, раз в 15 минут) — не является постоянно висящим процессом."""
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from settings import CONFIG
 from storage import db
@@ -10,7 +10,10 @@ WINDOW_MINUTES = 20  # насколько "опаздание" от точног
 
 def check_and_publish() -> None:
     db.init_db()
-    now = datetime.now()
+    if CONFIG.get("dorama", {}).get("require_review", True):
+        print("Ручная проверка включена: автоматическая публикация из очереди пропущена")
+        return
+    now = datetime.now(timezone.utc).astimezone()
     today = now.strftime("%Y-%m-%d")
 
     for platform in ("telegram", "youtube"):
@@ -22,16 +25,19 @@ def check_and_publish() -> None:
             slot_dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
             if not (slot_dt <= now <= slot_dt + timedelta(minutes=WINDOW_MINUTES)):
                 continue
-            if db.platform_slot_already_fired(today, slot, platform):
+            if not db.try_claim_platform_slot(today, slot, platform):
                 continue
-            if platform == "telegram":
-                from publisher import telegram
-                posted = telegram.publish_next()
-            else:
-                from publisher import youtube
-                posted = youtube.publish_next(privacy_status=platform_cfg["privacy_status"])
-            db.mark_platform_slot_fired(today, slot, platform)
-            message = "Опубликовано" if posted else "Очередь пуста"
+            try:
+                if platform == "telegram":
+                    from publisher import telegram
+                    publish_result: object = telegram.publish_next()
+                else:
+                    from publisher import youtube
+                    publish_result = youtube.publish_next(privacy_status=platform_cfg["privacy_status"])
+            except BaseException:
+                db.release_platform_slot(today, slot, platform)
+                raise
+            message = "Опубликовано" if publish_result else "Очередь пуста"
             print(f"[{now:%Y-%m-%d %H:%M}] {platform} {slot}: {message}")
 
 

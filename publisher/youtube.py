@@ -1,8 +1,9 @@
 """Официальная загрузка на YouTube Data API v3 через OAuth 2.0."""
-from pathlib import Path
 import re
-import shutil
+from pathlib import Path
+from typing import Any, Protocol
 
+from job_control import checkpoint
 from settings import (
     CONFIG,
     POSTED_DIR,
@@ -10,19 +11,26 @@ from settings import (
     YOUTUBE_TOKEN_PATH,
 )
 from storage import db
+from storage.files import atomic_write_text, move_to_unique
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 VALID_PRIVACY = {"private", "unlisted", "public"}
 
 
-def _credentials(interactive: bool):
+class ClipRow(Protocol):
+    def __getitem__(self, key: str) -> Any: ...
+
+
+def _credentials(interactive: bool) -> Any:
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google_auth_oauthlib.flow import (  # type: ignore[import-untyped]
+        InstalledAppFlow,
+    )
 
     credentials = None
     if YOUTUBE_TOKEN_PATH.is_file():
-        credentials = Credentials.from_authorized_user_file(str(YOUTUBE_TOKEN_PATH), SCOPES)
+        credentials = Credentials.from_authorized_user_file(str(YOUTUBE_TOKEN_PATH), SCOPES)  # type: ignore[no-untyped-call]
     if credentials and credentials.expired and credentials.refresh_token:
         credentials.refresh(Request())
     if credentials and credentials.valid:
@@ -37,12 +45,12 @@ def _credentials(interactive: bool):
     flow = InstalledAppFlow.from_client_secrets_file(str(YOUTUBE_CLIENT_SECRETS_PATH), SCOPES)
     credentials = flow.run_local_server(port=0, open_browser=True)
     YOUTUBE_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    YOUTUBE_TOKEN_PATH.write_text(credentials.to_json(), encoding="utf-8")
+    atomic_write_text(YOUTUBE_TOKEN_PATH, credentials.to_json(), private=True)
     return credentials
 
 
-def _service(interactive: bool = False):
-    from googleapiclient.discovery import build
+def _service(interactive: bool = False) -> Any:
+    from googleapiclient.discovery import build  # type: ignore[import-untyped]
 
     return build("youtube", "v3", credentials=_credentials(interactive), cache_discovery=False)
 
@@ -51,7 +59,7 @@ def authorize() -> Path:
     # OAuth-поток уже проверяет полученный токен. Название канала здесь намеренно
     # не читаем: для этого потребовалось бы отдельное разрешение youtube.readonly.
     _credentials(interactive=True)
-    return YOUTUBE_TOKEN_PATH
+    return Path(YOUTUBE_TOKEN_PATH)
 
 
 def _hashtags(caption: str) -> list[str]:
@@ -65,7 +73,7 @@ def _hashtags(caption: str) -> list[str]:
     return tags[:15]
 
 
-def build_metadata(clip, privacy_status: str | None = None) -> dict:
+def build_metadata(clip: ClipRow, privacy_status: str | None = None) -> dict[str, Any]:
     cfg = CONFIG["publishing"]["youtube"]
     privacy = privacy_status or cfg["privacy_status"]
     if privacy not in VALID_PRIVACY:
@@ -96,7 +104,7 @@ def build_metadata(clip, privacy_status: str | None = None) -> dict:
     }
 
 
-def preview(clip_id: int) -> dict:
+def preview(clip_id: int) -> dict[str, Any]:
     db.init_db()
     clip = db.get_clip(clip_id)
     if clip is None:
@@ -107,58 +115,64 @@ def preview(clip_id: int) -> dict:
 
 
 def publish_next(clip_id: int | None = None, privacy_status: str | None = None) -> str | None:
-    from googleapiclient.http import MediaFileUpload
+    from googleapiclient.http import MediaFileUpload  # type: ignore[import-untyped]
 
     db.init_db()
-    clip = db.get_clip(clip_id) if clip_id is not None else db.get_oldest_pending()
+    clip = db.claim_pending("youtube", clip_id=clip_id)
     if clip is None:
         return None
-    if clip["status"] != "pending":
-        raise RuntimeError(f"Ролик #{clip['id']} уже имеет статус {clip['status']}")
+    claim_token = str(clip["claim_token"])
     file_path = Path(clip["file_path"])
     if not file_path.is_file():
+        db.release_claim(int(clip["id"]), claim_token, f"Файл не найден: {file_path}")
         raise FileNotFoundError(f"Файл ролика не найден: {file_path}")
 
     cfg = CONFIG["publishing"]["youtube"]
-    media_upload = MediaFileUpload(
-        str(file_path),
-        mimetype="video/mp4",
-        chunksize=8 * 1024 * 1024,
-        resumable=True,
-    )
-    request = _service().videos().insert(
-        part="snippet,status",
-        body=build_metadata(clip, privacy_status),
-        notifySubscribers=bool(cfg.get("notify_subscribers", False)),
-        media_body=media_upload,
-    )
+    media_upload = None
     response = None
+    external_success = False
     try:
+        media_upload = MediaFileUpload(
+            str(file_path),
+            mimetype="video/mp4",
+            chunksize=8 * 1024 * 1024,
+            resumable=True,
+        )
+        request = _service().videos().insert(
+            part="snippet,status",
+            body=build_metadata(clip, privacy_status),
+            notifySubscribers=bool(cfg.get("notify_subscribers", False)),
+            media_body=media_upload,
+        )
         while response is None:
+            checkpoint()
             progress, response = request.next_chunk()
             if progress:
                 print(f"  YouTube upload: {progress.progress() * 100:.0f}%")
+        external_success = True
+    except BaseException as exc:
+        if not external_success:
+            db.release_claim(int(clip["id"]), claim_token, str(exc))
+        raise
     finally:
         # MediaFileUpload держит дескриптор до уничтожения объекта. На Windows
         # его нужно закрыть явно до перемещения уже загруженного MP4.
-        stream = media_upload.stream()
-        if not stream.closed:
-            stream.close()
+        if media_upload is not None:
+            stream = media_upload.stream()
+            if not stream.closed:
+                stream.close()
     video_id = response.get("id")
     if not video_id:
         raise RuntimeError(f"YouTube не вернул ID загруженного видео: {response}")
 
-    destination_dir = POSTED_DIR / "youtube"
-    destination_dir.mkdir(parents=True, exist_ok=True)
-    destination = destination_dir / file_path.name
     # Сначала фиксируем внешний успех, чтобы локальная ошибка не привела к
     # повторной загрузке того же ролика при следующем запуске.
-    db.mark_posted(clip["id"], platform=f"youtube:{video_id}")
+    db.mark_posted_claimed(int(clip["id"]), claim_token, platform=f"youtube:{video_id}")
     try:
-        shutil.move(str(file_path), str(destination))
+        destination = move_to_unique(file_path, POSTED_DIR / "youtube")
     except OSError as exc:
         raise RuntimeError(
             f"Видео загружено как {video_id}, но локальный файл не перемещён: {exc}"
         ) from exc
-    db.update_file_path(clip["id"], str(destination))
-    return video_id
+    db.update_file_path(int(clip["id"]), str(destination))
+    return str(video_id)

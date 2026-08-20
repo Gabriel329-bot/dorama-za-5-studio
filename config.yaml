@@ -3,13 +3,15 @@
 whisper:
   model: medium        # tiny/base/small/medium/large-v3 — больше = точнее и медленнее
   language: ru
-  device: cpu           # cpu или cuda, если есть nvidia-gpu
+  device: cuda         # RTX/NVIDIA: cuda; при ошибке программа безопасно вернётся на CPU
+  compute_type: auto   # auto = float16 на CUDA, int8 на CPU
+  cuda_fallback: true
 
 highlight:
   provider: ollama
   ollama_host: http://localhost:11434
-  model: qwen2.5:7b     # если ПК слабый (мало RAM/нет GPU) — замени на qwen2.5:3b
-  context_tokens: 16384 # окно контекста Ollama; хватает на ~1.5 часа речи. Больше = больше RAM
+  model: qwen2.5:7b     # если ПК слабый — замените на qwen2.5:3b
+  context_tokens: 16384 # окно контекста Ollama
   min_segment_seconds: 20
   max_segment_seconds: 59
   max_segments_per_video: 5
@@ -17,36 +19,79 @@ highlight:
 render:
   output_width: 1080
   output_height: 1920
+  video_encoder: auto   # auto: NVENC -> QSV -> AMF -> libx264
+  hardware_quality: 22
+  hardware_preset: p4
+  software_crf: 21
+  software_preset: veryfast
   font: Arial
   font_size: 64
-  highlight_color: "&H0000D7FF"   # ASS BGR: жёлтый — подсветка текущего слова
-  base_color: "&H00FFFFFF"        # белый — обычный текст
+  highlight_color: '&H0000D7FF'  # ASS BGR: жёлтый — текущее слово
+  base_color: '&H00FFFFFF'       # белый — обычный текст
+
+audio_processing:
+  voice_isolation:
+    enabled: true
+    python_path: audio-venv/Scripts/python.exe
+    model: htdemucs
+    device: cuda
+    segment_seconds: 7       # безопасно для RTX 3060 6 ГБ
+    overlap: 0.25
+    shifts: 1
+    cpu_fallback: true
+    timeout_seconds: 3600
+  loudness:
+    background_lufs: -24.0   # EBU R128 bed до ducking
+    voice_lufs: -16.0
+    final_lufs: -14.0
+    true_peak_db: -1.5
+    codec_headroom_db: 2.1  # запас лимитера под inter-sample peak после AAC
+    lra: 11.0
+    voice_lra: 7.0
+  ducking:
+    threshold: 0.035
+    ratio: 8.0
+    attack_ms: 18.0
+    release_ms: 280.0
+
+subtitles:
+  min_cps: 12.0
+  max_cps: 17.0
+  max_cpl: 42
+  max_lines: 2
+  min_duration: 0.9
+  max_duration: 6.0
+  gap_seconds: 0.033333
+  frame_rate: 30.0
+  scene_threshold: 0.32
+  scene_snap_seconds: 0.16
+  max_word_gap: 0.75
 
 publishing:
   telegram:
-    enabled: false                      # включить после заполнения TELEGRAM_* в .env
-    post_times: ["10:00", "19:00"]   # локальное время, когда scheduler.py может постить
+    enabled: false                    # включить после заполнения TELEGRAM_* в .env
+    post_times: ['10:00', '19:00']   # локальное время
   youtube:
-    enabled: false  # включайте только после OAuth и приватной тестовой загрузки
-    post_times: ["12:00"]
-    privacy_status: private  # private | unlisted | public
-    category_id: "24"                 # Entertainment
+    enabled: false                    # включать после OAuth и приватной тестовой загрузки
+    post_times: ['12:00']
+    privacy_status: private           # private | unlisted | public
+    category_id: '24'                 # Entertainment
     notify_subscribers: false
     client_secrets_path: oauth/client_secrets.json
     token_path: oauth/youtube_token.json
 
 dorama:
-  search_query: "китайские дорамы 2026"
-  search_results: 10  # результатов на каждый источник
+  search_query: 'китайские дорамы 2026'
+  search_results: 10
   search_sources: [youtube, bilibili, dailymotion, internet_archive, wikimedia_commons]
   voice_preset: tiktok_story
-  voice: "ru-RU-DmitryNeural"
-  rate: "+12%"
-  pitch: "-2Hz"
+  voice: 'ru-RU-DmitryNeural'
+  rate: '+12%'
+  pitch: '-2Hz'
   tts_provider: edge
   chatterbox_device: cuda
-  chatterbox_voice_reference: ""  # WAV 10-15 секунд с разрешённым голосом; пусто = встроенный голос
-  chatterbox_cfg_weight: 0.0       # убирает перенос иностранного акцента без русского образца
+  chatterbox_voice_reference: ''  # WAV 10–15 секунд с разрешённым голосом
+  chatterbox_cfg_weight: 0.0
   chatterbox_exaggeration: 0.35
   chatterbox_temperature: 0.55
   tts_fallback_to_edge: true
@@ -54,26 +99,29 @@ dorama:
   tts_qa_min_similarity: 0.88
   target_duration_seconds: 300
   target_script_words: 680
-  base_hashtags: ["#китайскиедорамы", "#дорамы", "#cdrama", "#чтопосмотреть"]
-  require_review: true
+  base_hashtags: ['#китайскиедорамы', '#дорамы', '#cdrama', '#чтопосмотреть']
+  require_review: true  # true блокирует автопубликацию планировщиком
 
 episode:
   target_duration_seconds: 300
-  target_narration_words: 650
+  target_narration_words: 680
   scene_count: 9
-  source_language: auto
   original_audio_volume: 0.16
+  source_language: auto
   require_rights_confirmation: true
 
 licensed_sources:
   youtube_search_results: 10
   search_sources: [youtube, wikimedia_commons, internet_archive]
-  download_height: 1080
-  max_download_mb: 2200
+  download_height: 720
+  max_download_mb: 700
   require_creative_commons: true
   # Канал можно добавить только при наличии отдельного письменного разрешения.
   # Формат: "UC_CHANNEL_ID": "номер договора или ссылка на разрешение"
   approved_channels: {}
+
+web:
+  max_upload_mb: 2048  # жёсткий лимит одной локальной загрузки
 
 paths:
   input_dir: input
@@ -81,3 +129,4 @@ paths:
   posted_dir: output/posted
   rejected_dir: output/rejected
   db_path: storage/queue.db
+  cache_dir: storage/cache
